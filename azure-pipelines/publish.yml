@@ -1,69 +1,53 @@
-steps:
-- checkout: self
-  fetchDepth: 0
+name: $(Date:yyyyMMdd)$(Rev:.r)
 
-- task: NodeTool@0
-  inputs:
-    versionSpec: "$(NODE_VERSION)"
+trigger:
+  branches:
+    include:
+      - main
+pr: none
 
-- script: |
-    set -euo pipefail
-    git fetch origin main
-    if ! git merge-base --is-ancestor "$BUILD_SOURCEVERSION" origin/main; then
-      echo "##vso[task.logissue type=error]Release tag points to a commit not on main. Refusing to publish unreviewed code."
-      exit 1
-    fi
-  displayName: Verify release tag is on main
-  condition: eq(variables.RUN_RELEASE_CHECKS, 'true')
+variables:
+  BUN_VERSION: '1.3.1'
 
-- script: |
-    set -euo pipefail
-    TAG_NAME="${BUILD_SOURCEBRANCH#refs/tags/}"
-    if [ "$TAG_NAME" = "$BUILD_SOURCEBRANCH" ]; then
-      echo "##vso[task.logissue type=error]Publish runs must be triggered from a tag. Got: $BUILD_SOURCEBRANCH"
-      exit 1
-    fi
+resources:
+  repositories:
+    - repository: templates
+      type: github
+      name: microsoft/vscode-sandbox-runtime
+      ref: main
+      endpoint: Monaco
 
-    TAG_VERSION="${TAG_NAME#v}"
-    PKG_VERSION=$(node -p "require('./package.json').version")
-    if [ "$TAG_VERSION" != "$PKG_VERSION" ]; then
-      echo "##vso[task.logissue type=error]Tag version ($TAG_VERSION) doesn't match package.json ($PKG_VERSION)"
-      exit 1
-    fi
-  displayName: Verify tag matches package.json version
-  condition: eq(variables.RUN_RELEASE_CHECKS, 'true')
+parameters:
+  - name: publishPackage
+    displayName: 🚀 Publish vscode-sandbox-runtime
+    type: boolean
+    default: false
 
-- task: DownloadPipelineArtifact@2
-  inputs:
-    buildType: current
-    artifactName: seccomp-x64
-    targetPath: vendor/seccomp/x64
+extends:
+  template: azure-pipelines/npm-package/pipeline.yml@templates
+  parameters:
+    npmPackages:
+      - name: vscode-sandbox-runtime
+        buildSteps:
+          - script: |
+              set -euo pipefail
+              git submodule update --init
+              # Install npm dependencies and required system packages
+              npm ci
+              # install required system packages for seccomp
+              sudo apt-get update && sudo apt-get install -y gcc libseccomp-dev
+              # install bun
+              curl -fsSL https://bun.sh/install | bash -s "bun-v$(BUN_VERSION)"
+              echo "##vso[task.prependpath]$HOME/.bun/bin"
+              export PATH="$HOME/.bun/bin:$PATH"
+              bun --version
+            displayName: Install dependencies
 
-- task: DownloadPipelineArtifact@2
-  inputs:
-    buildType: current
-    artifactName: seccomp-arm64
-    targetPath: vendor/seccomp/arm64
+          - script: |
+              npm run clean && npm run build
+              npm run build:seccomp
+            displayName: Build
 
-- script: chmod +x vendor/seccomp/*/apply-seccomp
-  displayName: Make seccomp binaries executable
-
-- script: npm install
-  displayName: Install Node dependencies
-
-- script: npm run clean && npm run build
-  displayName: Build package
-
-- script: |
-    set -euo pipefail
-    if [ -z "${NODE_AUTH_TOKEN:-}" ]; then
-      echo "##vso[task.logissue type=error]NPM_TOKEN pipeline variable is required to publish."
-      exit 1
-    fi
-
-    printf '//registry.npmjs.org/:_authToken=%s\n' "$NODE_AUTH_TOKEN" > "$HOME/.npmrc"
-    npm publish --provenance --access public
-  displayName: Publish to npm
-  condition: eq(variables.PUBLISH_TO_NPM, 'true')
-  env:
-    NODE_AUTH_TOKEN: $(NPM_TOKEN)
+        apiScanSoftwareName: 'vscode-sandbox-runtime'
+        apiScanSoftwareVersion: '0'
+        publishPackage: ${{ parameters.publishPackage }}
