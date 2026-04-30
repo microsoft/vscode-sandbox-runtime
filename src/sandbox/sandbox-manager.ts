@@ -43,9 +43,9 @@ import type { ResolvedParentProxy } from './parent-proxy.js'
 import { EOL } from 'node:os'
 
 interface HostNetworkManagerContext {
-  httpProxyPort: number
-  socksProxyPort: number
-  linuxBridge: LinuxNetworkBridgeContext | undefined
+  httpProxyPort?: number
+  socksProxyPort?: number
+  linuxBridge?: LinuxNetworkBridgeContext
 }
 
 // ============================================================================
@@ -99,6 +99,12 @@ function matchesDomainPattern(hostname: string, pattern: string): boolean {
   return h === pattern.toLowerCase()
 }
 
+function isNetworkIsolationEnabled(
+  network: SandboxRuntimeConfig['network'] | undefined,
+): boolean {
+  return network?.enabled !== false
+}
+
 async function filterNetworkRequest(
   port: number,
   host: string,
@@ -107,6 +113,11 @@ async function filterNetworkRequest(
   if (!config) {
     logForDebugging('No config available, denying network request')
     return false
+  }
+
+  if (!isNetworkIsolationEnabled(config.network)) {
+    logForDebugging(`Network isolation disabled, allowing: ${host}:${port}`)
+    return true
   }
 
   // Reject hosts containing control characters before pattern matching.
@@ -300,6 +311,15 @@ async function initialize(
   // Initialize network infrastructure
   initializationPromise = (async () => {
     try {
+      if (!isNetworkIsolationEnabled(config.network)) {
+        const context: HostNetworkManagerContext = {}
+        managerContext = context
+        logForDebugging(
+          'Network isolation disabled; skipping network infrastructure',
+        )
+        return context
+      }
+
       // Conditionally start proxy servers based on config
       let httpProxyPort: number
       if (config.network.httpProxyPort !== undefined) {
@@ -489,6 +509,10 @@ function getNetworkRestrictionConfig(): NetworkRestrictionConfig {
     return {}
   }
 
+  if (!isNetworkIsolationEnabled(config.network)) {
+    return { enabled: false }
+  }
+
   const allowedHosts = config.network.allowedDomains
   const deniedHosts = config.network.deniedDomains
 
@@ -645,9 +669,15 @@ async function wrapWithSandbox(
   // 1. customConfig has network.allowedDomains defined (even if empty array = block all)
   // 2. OR config has network.allowedDomains defined (even if empty array = block all)
   // An empty allowedDomains array means "no domains allowed" = block all network access
+  // Set network.enabled to false to skip network isolation/filtering while
+  // still applying filesystem restrictions.
+  const effectiveNetworkConfig = customConfig?.network ?? config?.network
+  const networkIsolationEnabled = isNetworkIsolationEnabled(
+    effectiveNetworkConfig,
+  )
   const hasNetworkConfig =
-    customConfig?.network?.allowedDomains !== undefined ||
-    config?.network?.allowedDomains !== undefined
+    networkIsolationEnabled &&
+    effectiveNetworkConfig?.allowedDomains !== undefined
 
   // Network RESTRICTION is needed whenever network config is specified
   // This includes empty allowedDomains which means "block all network"
