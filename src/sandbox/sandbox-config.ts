@@ -70,6 +70,33 @@ const MitmProxyConfigSchema = z.object({
 })
 
 /**
+ * Schema for upstream/parent HTTP proxy configuration.
+ * Used when SRT itself runs behind a corporate proxy and cannot make direct
+ * outbound connections.
+ */
+const ParentProxyConfigSchema = z.object({
+  http: z
+    .string()
+    .url()
+    .optional()
+    .describe('Upstream proxy URL for plain HTTP traffic'),
+  https: z
+    .string()
+    .url()
+    .optional()
+    .describe(
+      'Upstream proxy URL for HTTPS/CONNECT traffic (falls back to http if unset)',
+    ),
+  noProxy: z
+    .string()
+    .optional()
+    .describe(
+      'Comma-separated NO_PROXY list (hostname suffixes and CIDR ranges). ' +
+        'Matching destinations connect directly instead of via the parent proxy.',
+    ),
+})
+
+/**
  * Network configuration schema for validation
  */
 export const NetworkConfigSchema = z.object({
@@ -95,6 +122,23 @@ export const NetworkConfigSchema = z.object({
     .boolean()
     .optional()
     .describe('Whether to allow binding to local ports (default: false)'),
+  allowMachLookup: z
+    .array(
+      z.string().refine(
+        val => {
+          const prefix = val.endsWith('*') ? val.slice(0, -1) : val
+          return !prefix.includes('*')
+        },
+        {
+          message:
+            'Wildcards are only allowed as a single trailing "*" (e.g., "com.example.*" or "*" for all services).',
+        },
+      ),
+    )
+    .optional()
+    .describe(
+      'macOS only: Additional XPC/Mach service names to allow looking up. Supports trailing-wildcard prefix matching (e.g., "2BUA8C4S2C.com.1password.*"). Needed for tools like 1Password CLI, Playwright, or the iOS Simulator that communicate via XPC.',
+    ),
   httpProxyPort: z
     .number()
     .int()
@@ -116,6 +160,12 @@ export const NetworkConfigSchema = z.object({
   mitmProxy: MitmProxyConfigSchema.optional().describe(
     'Optional MITM proxy configuration. Routes matching domains through an upstream proxy via Unix socket while SRT still handles allow/deny filtering.',
   ),
+  parentProxy: ParentProxyConfigSchema.optional().describe(
+    "Upstream HTTP proxy for outbound connections. When set, SRT's proxy " +
+      'tunnels non-mitmProxy traffic through this parent instead of ' +
+      'connecting directly. Falls back to HTTP_PROXY/HTTPS_PROXY/NO_PROXY ' +
+      'env vars if unset.',
+  ),
 })
 
 /**
@@ -123,6 +173,13 @@ export const NetworkConfigSchema = z.object({
  */
 export const FilesystemConfigSchema = z.object({
   denyRead: z.array(filesystemPathSchema).describe('Paths denied for reading'),
+  allowRead: z
+    .array(filesystemPathSchema)
+    .optional()
+    .describe(
+      'Paths to re-allow reading within denied regions (takes precedence over denyRead). ' +
+        'Use with denyRead to deny a broad region then allow back specific subdirectories.',
+    ),
   allowWrite: z
     .array(filesystemPathSchema)
     .describe('Paths allowed for writing'),
@@ -166,14 +223,20 @@ export const RipgrepConfigSchema = z.object({
 
 /**
  * Seccomp configuration schema (Linux only)
- * Allows specifying custom paths to seccomp binaries
  */
 export const SeccompConfigSchema = z.object({
-  bpfPath: z
+  applyPath: z.string().optional().describe('Path to the apply-seccomp binary'),
+  argv0: z
     .string()
     .optional()
-    .describe('Path to the unix-block.bpf filter file'),
-  applyPath: z.string().optional().describe('Path to the apply-seccomp binary'),
+    .describe(
+      'Invoke apply-seccomp as a multicall binary that dispatches on the ' +
+        'ARGV0 environment variable. When set, applyPath is used verbatim ' +
+        '(no existence check) and the invocation inside bwrap is prefixed ' +
+        'with ARGV0=<this value>. The caller is responsible for ensuring ' +
+        'applyPath resolves inside the bwrap namespace and that the target ' +
+        'binary implements the apply-seccomp interface when ARGV0 matches.',
+    ),
 })
 
 /**
@@ -224,6 +287,7 @@ export const SandboxRuntimeConfigSchema = z.object({
 
 // Export inferred types
 export type MitmProxyConfig = z.infer<typeof MitmProxyConfigSchema>
+export type ParentProxyConfig = z.infer<typeof ParentProxyConfigSchema>
 export type NetworkConfig = z.infer<typeof NetworkConfigSchema>
 export type FilesystemConfig = z.infer<typeof FilesystemConfigSchema>
 export type IgnoreViolationsConfig = z.infer<

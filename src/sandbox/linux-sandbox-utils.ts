@@ -20,12 +20,8 @@ import type {
   FsReadRestrictionConfig,
   FsWriteRestrictionConfig,
 } from './sandbox-schemas.js'
-import {
-  generateSeccompFilter,
-  cleanupSeccompFilter,
-  getPreGeneratedBpfPath,
-  getApplySeccompBinaryPath,
-} from './generate-seccomp-filter.js'
+import { getApplySeccompBinaryPath } from './generate-seccomp-filter.js'
+import type { SeccompConfig } from './sandbox-config.js'
 
 export interface LinuxNetworkBridgeContext {
   httpSocketPath: string
@@ -54,7 +50,7 @@ export interface LinuxSandboxParams {
   /** Allow writes to .git/config files (default: false) */
   allowGitConfig?: boolean
   /** Custom seccomp binary paths */
-  seccompConfig?: { bpfPath?: string; applyPath?: string }
+  seccompConfig?: SeccompConfig
   /** Abort signal to cancel the ripgrep scan */
   abortSignal?: AbortSignal
 }
@@ -281,19 +277,23 @@ async function linuxGetMandatoryDenyPaths(
   return [...new Set(denyPaths)]
 }
 
-// Track generated seccomp filters for cleanup on process exit
-const generatedSeccompFilters: Set<string> = new Set()
-
 // Track mount points created by bwrap for non-existent deny paths.
 // When bwrap does --ro-bind /dev/null /nonexistent/path, it creates an empty
 // file on the host as a mount point. These persist after bwrap exits and must
 // be cleaned up explicitly.
 const bwrapMountPoints: Set<string> = new Set()
 
+// Number of wrapped commands that have been generated but whose cleanup has
+// not yet run. cleanupBwrapMountPoints() defers file deletion while this is
+// positive, because deleting a mount point file on the host while another
+// bwrap instance is still running detaches that instance's bind mount and
+// the deny rule stops applying inside it.
+let activeSandboxCount = 0
+
 let exitHandlerRegistered = false
 
 /**
- * Register cleanup handler for generated seccomp filters and bwrap mount points
+ * Register cleanup handler for bwrap mount points
  */
 function registerExitCleanupHandler(): void {
   if (exitHandlerRegistered) {
@@ -301,14 +301,7 @@ function registerExitCleanupHandler(): void {
   }
 
   process.on('exit', () => {
-    for (const filterPath of generatedSeccompFilters) {
-      try {
-        cleanupSeccompFilter(filterPath)
-      } catch {
-        // Ignore cleanup errors during exit
-      }
-    }
-    cleanupBwrapMountPoints()
+    cleanupBwrapMountPoints({ force: true })
   })
 
   exitHandlerRegistered = true
@@ -325,10 +318,31 @@ function registerExitCleanupHandler(): void {
  * ghost dotfiles (e.g. .bashrc, .gitconfig) from appearing in the working
  * directory. It is also called automatically on process exit as a safety net.
  *
- * Safe to call at any time — it only removes files that were tracked during
- * generateFilesystemArgs() and skips any that no longer exist.
+ * Each call decrements the active-sandbox counter that was incremented by
+ * wrapCommandWithSandboxLinux(). File deletion is deferred until the counter
+ * reaches zero. Deleting a mount point file on the host while another bwrap
+ * instance is still running detaches that instance's bind mount (the dentry
+ * is unhashed, so path lookup no longer finds the mount) and the deny rule
+ * stops applying inside that sandbox.
+ *
+ * Pass `{ force: true }` to delete unconditionally — used by the process-exit
+ * handler and reset() where deferral is not meaningful.
  */
-export function cleanupBwrapMountPoints(): void {
+export function cleanupBwrapMountPoints(opts?: { force?: boolean }): void {
+  if (!opts?.force) {
+    if (activeSandboxCount > 0) {
+      activeSandboxCount--
+    }
+    if (activeSandboxCount > 0) {
+      logForDebugging(
+        `[Sandbox Linux] Deferring mount point cleanup — ${activeSandboxCount} sandbox(es) still active`,
+      )
+      return
+    }
+  } else {
+    activeSandboxCount = 0
+  }
+
   for (const mountPoint of bwrapMountPoints) {
     try {
       // Only remove if it's still the empty file/directory bwrap created.
@@ -363,7 +377,6 @@ export function cleanupBwrapMountPoints(): void {
 export type LinuxDependencyStatus = {
   hasBwrap: boolean
   hasSocat: boolean
-  hasSeccompBpf: boolean
   hasSeccompApply: boolean
 }
 
@@ -378,26 +391,26 @@ export type SandboxDependencyCheck = {
 /**
  * Get detailed status of Linux sandbox dependencies
  */
-export function getLinuxDependencyStatus(seccompConfig?: {
-  bpfPath?: string
-  applyPath?: string
-}): LinuxDependencyStatus {
+export function getLinuxDependencyStatus(
+  seccompConfig?: SeccompConfig,
+): LinuxDependencyStatus {
+  // argv0 mode: apply-seccomp is compiled into the caller's binary — skip
+  // the on-disk lookup and trust that applyPath resolves inside bwrap.
   return {
     hasBwrap: whichSync('bwrap') !== null,
     hasSocat: whichSync('socat') !== null,
-    hasSeccompBpf: getPreGeneratedBpfPath(seccompConfig?.bpfPath) !== null,
-    hasSeccompApply:
-      getApplySeccompBinaryPath(seccompConfig?.applyPath) !== null,
+    hasSeccompApply: seccompConfig?.argv0
+      ? true
+      : getApplySeccompBinaryPath(seccompConfig?.applyPath) !== null,
   }
 }
 
 /**
  * Check sandbox dependencies and return structured result
  */
-export function checkLinuxDependencies(seccompConfig?: {
-  bpfPath?: string
-  applyPath?: string
-}): SandboxDependencyCheck {
+export function checkLinuxDependencies(
+  seccompConfig?: SeccompConfig,
+): SandboxDependencyCheck {
   const errors: string[] = []
   const warnings: string[] = []
 
@@ -405,9 +418,10 @@ export function checkLinuxDependencies(seccompConfig?: {
     errors.push('bubblewrap (bwrap) not installed')
   if (whichSync('socat') === null) errors.push('socat not installed')
 
-  const hasBpf = getPreGeneratedBpfPath(seccompConfig?.bpfPath) !== null
-  const hasApply = getApplySeccompBinaryPath(seccompConfig?.applyPath) !== null
-  if (!hasBpf || !hasApply) {
+  if (
+    !seccompConfig?.argv0 &&
+    getApplySeccompBinaryPath(seccompConfig?.applyPath) === null
+  ) {
     warnings.push('seccomp not available - unix socket access not restricted')
   }
 
@@ -569,6 +583,31 @@ export async function initializeLinuxNetworkBridge(
 }
 
 /**
+ * Resolve how to invoke apply-seccomp: either a standalone binary path, or a
+ * multicall-binary prefix that dispatches on the ARGV0 env var.
+ *
+ * Returns a shell-ready string ending in a trailing space — callers append
+ * shellquote.quote([shell, '-c', cmd]). Returns undefined when seccomp is
+ * unavailable (no argv0, no binary found).
+ *
+ * When argv0 is set, applyPath is used verbatim (no existence check); the
+ * caller is responsible for ensuring it resolves inside the bwrap namespace.
+ */
+function resolveApplySeccompPrefix(
+  applyPath: string | undefined,
+  argv0: string | undefined,
+): string | undefined {
+  if (argv0) {
+    if (!applyPath) {
+      throw new Error('seccompConfig.argv0 requires seccompConfig.applyPath')
+    }
+    return `ARGV0=${shellquote.quote([argv0])} ${shellquote.quote([applyPath])} `
+  }
+  const binary = getApplySeccompBinaryPath(applyPath)
+  return binary ? `${shellquote.quote([binary])} ` : undefined
+}
+
+/**
  * Build the command that runs inside the sandbox.
  * Sets up HTTP proxy on port 3128 and SOCKS proxy on port 1080
  */
@@ -576,9 +615,8 @@ function buildSandboxCommand(
   httpSocketPath: string,
   socksSocketPath: string,
   userCommand: string,
-  seccompFilterPath: string | undefined,
+  applySeccompPrefix: string | undefined,
   shell?: string,
-  applySeccompPath?: string,
 ): string {
   // Default to bash for backward compatibility
   const shellPath = shell || 'bash'
@@ -588,44 +626,17 @@ function buildSandboxCommand(
     'trap "kill %1 %2 2>/dev/null; exit" EXIT',
   ]
 
-  // If seccomp filter is provided, use apply-seccomp to apply it
-  if (seccompFilterPath) {
-    // apply-seccomp approach:
-    // 1. Outer bwrap/bash: starts socat processes (can use Unix sockets)
-    // 2. apply-seccomp: applies seccomp filter and execs user command
-    // 3. User command runs with seccomp active (Unix sockets blocked)
-    //
-    // apply-seccomp is a simple C program that:
-    // - Sets PR_SET_NO_NEW_PRIVS
-    // - Applies the seccomp BPF filter via prctl(PR_SET_SECCOMP)
-    // - Execs the user command
-    //
-    // This is simpler and more portable than nested bwrap, with no FD redirects needed.
-    const applySeccompBinary = getApplySeccompBinaryPath(applySeccompPath)
-    if (!applySeccompBinary) {
-      throw new Error(
-        'apply-seccomp binary not found. This should have been caught earlier. ' +
-          'Ensure vendor/seccomp/{x64,arm64}/apply-seccomp binaries are included in the package.',
-      )
-    }
-
-    const applySeccompCmd = shellquote.quote([
-      applySeccompBinary,
-      seccompFilterPath,
-      shellPath,
-      '-c',
-      userCommand,
-    ])
-
+  // apply-seccomp runs after socat so socat can still create Unix sockets.
+  if (applySeccompPrefix) {
+    const applySeccompCmd =
+      applySeccompPrefix + shellquote.quote([shellPath, '-c', userCommand])
     const innerScript = [...socatCommands, applySeccompCmd].join('\n')
     return `${shellPath} -c ${shellquote.quote([innerScript])}`
   } else {
-    // No seccomp filter - run user command directly
     const innerScript = [
       ...socatCommands,
       `eval ${shellquote.quote([userCommand])}`,
     ].join('\n')
-
     return `${shellPath} -c ${shellquote.quote([innerScript])}`
   }
 }
@@ -644,13 +655,17 @@ async function generateFilesystemArgs(
   const args: string[] = []
   // fs already imported
 
+  // Collect normalized allowed write paths. Populated in the writeConfig
+  // block, read again in the denyRead loop to re-bind writes under tmpfs.
+  const allowedWritePaths: string[] = []
+  // denyWrite binds are buffered and emitted after denyRead processing so that
+  // a denyRead tmpfs over an ancestor directory doesn't wipe them out.
+  const denyWriteArgs: string[] = []
+
   // Determine initial root mount based on write restrictions
   if (writeConfig) {
     // Write restrictions: Start with read-only root, then allow writes to specific paths
     args.push('--ro-bind', '/', '/')
-
-    // Collect normalized allowed write paths for later checking
-    const allowedWritePaths: string[] = []
 
     // Allow writes to specific paths
     for (const pathPattern of writeConfig.allowOnly || []) {
@@ -714,8 +729,15 @@ async function generateFilesystemArgs(
       )),
     ]
 
+    // Dedup post-normalization: entries like ['~/.foo', '/home/user/.foo']
+    // converge to the same path here. A duplicate --ro-bind /dev/null <dest>
+    // hits a char device on the second pass and bwrap's ensure_file() falls
+    // through to creat() on a read-only mount.
+    const seenDenyWrite = new Set<string>()
     for (const pathPattern of denyPaths) {
       const normalizedPath = normalizePathForSandbox(pathPattern)
+      if (seenDenyWrite.has(normalizedPath)) continue
+      seenDenyWrite.add(normalizedPath)
 
       // Skip /dev/* paths since --dev /dev already handles them
       if (normalizedPath.startsWith('/dev/')) {
@@ -728,7 +750,7 @@ async function generateFilesystemArgs(
       // symlink and creates real .claude/settings.json with malicious hooks.
       const symlinkInPath = findSymlinkInPath(normalizedPath, allowedWritePaths)
       if (symlinkInPath) {
-        args.push('--ro-bind', '/dev/null', symlinkInPath)
+        denyWriteArgs.push('--ro-bind', '/dev/null', symlinkInPath)
         logForDebugging(
           `[Sandbox Linux] Mounted /dev/null at symlink ${symlinkInPath} to prevent symlink replacement attack`,
         )
@@ -780,14 +802,14 @@ async function generateFilesystemArgs(
             const emptyDir = fs.mkdtempSync(
               path.join(tmpdir(), 'claude-empty-'),
             )
-            args.push('--ro-bind', emptyDir, firstNonExistent)
+            denyWriteArgs.push('--ro-bind', emptyDir, firstNonExistent)
             bwrapMountPoints.add(firstNonExistent)
             registerExitCleanupHandler()
             logForDebugging(
               `[Sandbox Linux] Mounted empty dir at ${firstNonExistent} to block creation of ${normalizedPath}`,
             )
           } else {
-            args.push('--ro-bind', '/dev/null', firstNonExistent)
+            denyWriteArgs.push('--ro-bind', '/dev/null', firstNonExistent)
             bwrapMountPoints.add(firstNonExistent)
             registerExitCleanupHandler()
             logForDebugging(
@@ -811,7 +833,7 @@ async function generateFilesystemArgs(
       )
 
       if (isWithinAllowedPath) {
-        args.push('--ro-bind', normalizedPath, normalizedPath)
+        denyWriteArgs.push('--ro-bind', normalizedPath, normalizedPath)
       } else {
         logForDebugging(
           `[Sandbox Linux] Skipping deny path not within allowed paths: ${normalizedPath}`,
@@ -822,9 +844,32 @@ async function generateFilesystemArgs(
     // No write restrictions: Allow all writes
     args.push('--bind', '/', '/')
   }
+  // denyWriteArgs is emitted after the denyRead loop below.
 
   // Handle read restrictions by mounting tmpfs over denied paths
-  const readDenyPaths = [...(readConfig?.denyOnly || [])]
+  const readDenyPaths: string[] = []
+  const readAllowPaths = (readConfig?.allowWithinDeny || []).map(p =>
+    normalizePathForSandbox(p),
+  )
+  // Files masked by --ro-bind /dev/null below. Used to filter denyWriteArgs so
+  // that --ro-bind <host> <host> doesn't undo the mask.
+  const maskedFiles = new Set<string>()
+
+  // --tmpfs / would wipe all prior mounts (ro-bind /, write binds, deny binds).
+  // Expand a root deny into its direct children so the existing per-dir tmpfs
+  // + re-bind logic applies. Skip /proc and /dev: they're remounted by the
+  // caller after this function returns. Skip /sys: kernel interface, tmpfs
+  // over it breaks tooling and the host /sys is already read-only via ro-bind.
+  const rootSkip = new Set(['proc', 'dev', 'sys'])
+  for (const p of readConfig?.denyOnly || []) {
+    if (normalizePathForSandbox(p) === '/') {
+      for (const child of fs.readdirSync('/')) {
+        if (!rootSkip.has(child)) readDenyPaths.push('/' + child)
+      }
+    } else {
+      readDenyPaths.push(p)
+    }
+  }
 
   // Always hide /etc/ssh/ssh_config.d to avoid permission issues with OrbStack
   // SSH is very strict about config file permissions and ownership, and they can
@@ -833,8 +878,14 @@ async function generateFilesystemArgs(
     readDenyPaths.push('/etc/ssh/ssh_config.d')
   }
 
-  for (const pathPattern of readDenyPaths) {
-    const normalizedPath = normalizePathForSandbox(pathPattern)
+  // Normalize then sort shallow-first so tmpfs over ancestor dirs lands before
+  // /dev/null masks on descendant files. Otherwise a file-deny listed before
+  // a dir-deny in denyRead gets wiped when the ancestor tmpfs is applied.
+  const normalizedDenyPaths = readDenyPaths
+    .map(p => normalizePathForSandbox(p))
+    .sort((a, b) => a.split('/').length - b.split('/').length)
+
+  for (const normalizedPath of normalizedDenyPaths) {
     if (!fs.existsSync(normalizedPath)) {
       logForDebugging(
         `[Sandbox Linux] Skipping non-existent read deny path: ${normalizedPath}`,
@@ -842,13 +893,78 @@ async function generateFilesystemArgs(
       continue
     }
 
+    const denySep = normalizedPath === '/' ? '/' : normalizedPath + '/'
     const readDenyStat = fs.statSync(normalizedPath)
     if (readDenyStat.isDirectory()) {
       args.push('--tmpfs', normalizedPath)
+
+      // tmpfs wiped any earlier write binds under this path — restore them.
+      for (const writePath of allowedWritePaths) {
+        if (writePath.startsWith(denySep) || writePath === normalizedPath) {
+          args.push('--bind', writePath, writePath)
+          logForDebugging(
+            `[Sandbox Linux] Re-bound write path wiped by denyRead tmpfs: ${writePath}`,
+          )
+        }
+      }
+
+      // Re-allow specific paths within the denied directory (allowRead overrides denyRead).
+      // After mounting tmpfs over the denied dir, bind back the allowed subdirectories
+      // so they are readable again.
+      for (const allowPath of readAllowPaths) {
+        if (allowPath.startsWith(denySep) || allowPath === normalizedPath) {
+          if (!fs.existsSync(allowPath)) {
+            logForDebugging(
+              `[Sandbox Linux] Skipping non-existent read allow path: ${allowPath}`,
+            )
+            continue
+          }
+          // Skip only if a write path was re-bound just above AND covers
+          // allowPath. A write path that's an ancestor of the deny dir isn't
+          // re-bound (it wasn't wiped), so allowPath under it still needs
+          // its own ro-bind here.
+          if (
+            allowedWritePaths.some(
+              w =>
+                (w.startsWith(denySep) || w === normalizedPath) &&
+                (allowPath === w || allowPath.startsWith(w + '/')),
+            )
+          ) {
+            continue
+          }
+          // Bind the allowed path back over the tmpfs so it's readable
+          args.push('--ro-bind', allowPath, allowPath)
+          logForDebugging(
+            `[Sandbox Linux] Re-allowed read access within denied region: ${allowPath}`,
+          )
+        }
+      }
     } else {
+      // For files, only an exact allowRead match overrides the deny. A
+      // directory allowRead does not un-deny a file specifically listed in
+      // denyRead — otherwise denyRead: ['.env'] + allowRead: ['.'] silently
+      // drops the .env deny.
+      if (readAllowPaths.includes(normalizedPath)) {
+        logForDebugging(
+          `[Sandbox Linux] Skipping read deny for re-allowed path: ${normalizedPath}`,
+        )
+        continue
+      }
       // For files, bind /dev/null instead of tmpfs
       args.push('--ro-bind', '/dev/null', normalizedPath)
+      maskedFiles.add(normalizedPath)
     }
+  }
+
+  // Emitting denyWrite last means these ro-binds layer on top of any write
+  // paths the denyRead loop just re-bound. Before this ordering, tmpfs over
+  // an ancestor of cwd would wipe the .git/hooks protection. But skip any
+  // dest already masked by denyRead — --ro-bind <host> <host> for denyWrite
+  // would undo --ro-bind /dev/null <host> from denyRead, which landed first.
+  for (let i = 0; i < denyWriteArgs.length; i += 3) {
+    const dest = denyWriteArgs[i + 2]!
+    if (maskedFiles.has(dest)) continue
+    args.push(denyWriteArgs[i]!, denyWriteArgs[i + 1]!, dest)
   }
 
   return args
@@ -867,10 +983,12 @@ async function generateFilesystemArgs(
  *   - Filesystem restrictions are applied (read-only mounts, bind mounts, etc.)
  *   - Socat processes start and connect to Unix socket bridges (can use socket(AF_UNIX, ...))
  *
- * Stage 2: apply-seccomp - Seccomp filter application (ONLY seccomp)
- *   - apply-seccomp binary applies seccomp filter via prctl(PR_SET_SECCOMP)
- *   - Sets PR_SET_NO_NEW_PRIVS to allow seccomp without root
+ * Stage 2: apply-seccomp - Nested PID namespace + seccomp filter
+ *   - apply-seccomp creates a nested user+PID+mount namespace and remounts /proc
+ *   - Inside, apply-seccomp becomes PID 1 (non-dumpable init/reaper)
+ *   - Forks, sets PR_SET_NO_NEW_PRIVS, applies seccomp via prctl(PR_SET_SECCOMP)
  *   - Execs user command with seccomp active (cannot create new Unix sockets)
+ *   - User command cannot see or ptrace bwrap/bash/socat (separate PID namespace)
  *
  * This solves the conflict between:
  * - Security: Blocking arbitrary Unix socket creation in user commands
@@ -937,41 +1055,36 @@ export async function wrapCommandWithSandboxLinux(
     return command
   }
 
+  // Mark this sandbox invocation as active. cleanupBwrapMountPoints() will
+  // defer file deletion until this (and every other concurrent) invocation
+  // has been cleaned up. The matching decrement happens in
+  // cleanupBwrapMountPoints(), which the caller must invoke after the
+  // spawned command exits. If wrapping fails below, the catch block
+  // decrements so the count does not leak.
+  activeSandboxCount++
+
   const bwrapArgs: string[] = ['--new-session', '--die-with-parent']
-  let seccompFilterPath: string | undefined = undefined
+  let applySeccompPrefix: string | undefined
 
   try {
     // ========== SECCOMP FILTER (Unix Socket Blocking) ==========
-    // Use bwrap's --seccomp flag to apply BPF filter that blocks Unix socket creation
-    //
-    // NOTE: Seccomp filtering is only enabled when allowAllUnixSockets is false
-    // (when true, Unix sockets are allowed)
+    // apply-seccomp wraps the workload and applies the baked-in BPF filter
+    // that blocks socket(AF_UNIX, ...). Skipped when allowAllUnixSockets is true.
     if (!allowAllUnixSockets) {
-      seccompFilterPath =
-        generateSeccompFilter(seccompConfig?.bpfPath) ?? undefined
-      const applySeccompBinary = getApplySeccompBinaryPath(
+      applySeccompPrefix = resolveApplySeccompPrefix(
         seccompConfig?.applyPath,
+        seccompConfig?.argv0,
       )
 
-      if (!seccompFilterPath || !applySeccompBinary) {
-        // Seccomp binaries not found - warn but continue without unix socket blocking
+      if (!applySeccompPrefix) {
         logForDebugging(
-          '[Sandbox Linux] Seccomp binaries not available - unix socket blocking disabled. ' +
+          '[Sandbox Linux] apply-seccomp binary not available - unix socket blocking disabled. ' +
             'Install @anthropic-ai/sandbox-runtime globally for full protection.',
           { level: 'warn' },
         )
-        // Clear the filter path so we don't try to use it
-        seccompFilterPath = undefined
       } else {
-        // Track filter for cleanup and register exit handler
-        // Only track runtime-generated filters (not pre-generated ones from vendor/)
-        if (!seccompFilterPath.includes('/vendor/seccomp/')) {
-          generatedSeccompFilters.add(seccompFilterPath)
-          registerExitCleanupHandler()
-        }
-
         logForDebugging(
-          '[Sandbox Linux] Generated seccomp BPF filter for Unix socket blocking',
+          '[Sandbox Linux] Applying seccomp filter for Unix socket blocking',
         )
       }
     } else {
@@ -1069,7 +1182,23 @@ export async function wrapCommandWithSandboxLinux(
     if (!enableWeakerNestedSandbox) {
       // Mount fresh /proc if PID namespace is isolated (secure mode)
       bwrapArgs.push('--proc', '/proc')
+    } else {
+      // --unshare-user: bwrap only auto-adds this when EUID != 0. In an
+      // unprivileged container (Docker's default: EUID=0 without
+      // CAP_SYS_ADMIN), bwrap assumes it has caps, tries direct clone,
+      // and EPERMs. Force the userns path so bwrap starts at all.
+      //
+      // --bind /proc /proc: apply-seccomp's nested-userns path writes
+      // /proc/self/setgroups and uid_map. Without --proc above, the
+      // --ro-bind / / leaves /proc read-only and those writes EROFS.
+      bwrapArgs.push('--unshare-user', '--bind', '/proc', '/proc')
     }
+
+    // apply-seccomp obtains CAP_SYS_ADMIN for its nested PID+mount unshare
+    // by creating a nested user namespace. This requires the host to permit
+    // capability-bearing unprivileged user namespaces (the same requirement
+    // bwrap itself has when not installed setuid). See README for the
+    // Ubuntu 24.04 sysctl if AppArmor restricts this.
 
     // ========== COMMAND ==========
     // Use the user's shell (zsh, bash, etc.) to ensure aliases/snapshots work
@@ -1081,53 +1210,33 @@ export async function wrapCommandWithSandboxLinux(
     }
     bwrapArgs.push('--', shell, '-c')
 
-    // If we have network restrictions, use the network bridge setup with apply-seccomp for seccomp
-    // Otherwise, just run the command directly with apply-seccomp if needed
+    // With network restrictions, route the command through buildSandboxCommand
+    // so socat starts before seccomp is applied. Otherwise invoke apply-seccomp
+    // directly if we have a binary.
     if (needsNetworkRestriction && httpSocketPath && socksSocketPath) {
-      // Pass seccomp filter to buildSandboxCommand for apply-seccomp application
-      // This allows socat to start before seccomp is applied
       const sandboxCommand = buildSandboxCommand(
         httpSocketPath,
         socksSocketPath,
         command,
-        seccompFilterPath,
+        applySeccompPrefix,
         shell,
-        seccompConfig?.applyPath,
       )
       bwrapArgs.push(sandboxCommand)
-    } else if (seccompFilterPath) {
-      // No network restrictions but we have seccomp - use apply-seccomp directly
-      // apply-seccomp is a simple C program that applies the seccomp filter and execs the command
-      const applySeccompBinary = getApplySeccompBinaryPath(
-        seccompConfig?.applyPath,
-      )
-      if (!applySeccompBinary) {
-        throw new Error(
-          'apply-seccomp binary not found. This should have been caught earlier. ' +
-            'Ensure vendor/seccomp/{x64,arm64}/apply-seccomp binaries are included in the package.',
-        )
-      }
-
-      const applySeccompCmd = shellquote.quote([
-        applySeccompBinary,
-        seccompFilterPath,
-        shell,
-        '-c',
-        command,
-      ])
+    } else if (applySeccompPrefix) {
+      const applySeccompCmd =
+        applySeccompPrefix + shellquote.quote([shell, '-c', command])
       bwrapArgs.push(applySeccompCmd)
     } else {
       bwrapArgs.push(command)
     }
 
-    // Build the outer bwrap command
     const wrappedCommand = shellquote.quote(['bwrap', ...bwrapArgs])
 
     const restrictions = []
     if (needsNetworkRestriction) restrictions.push('network')
     if (hasReadRestrictions || hasWriteRestrictions)
       restrictions.push('filesystem')
-    if (seccompFilterPath) restrictions.push('seccomp(unix-block)')
+    if (applySeccompPrefix) restrictions.push('seccomp(unix-block)')
 
     logForDebugging(
       `[Sandbox Linux] Wrapped command with bwrap (${restrictions.join(', ')} restrictions)`,
@@ -1135,19 +1244,11 @@ export async function wrapCommandWithSandboxLinux(
 
     return wrappedCommand
   } catch (error) {
-    // Clean up seccomp filter on error
-    if (seccompFilterPath && !seccompFilterPath.includes('/vendor/seccomp/')) {
-      generatedSeccompFilters.delete(seccompFilterPath)
-      try {
-        cleanupSeccompFilter(seccompFilterPath)
-      } catch (cleanupError) {
-        logForDebugging(
-          `[Sandbox Linux] Failed to clean up seccomp filter on error: ${cleanupError}`,
-          { level: 'error' },
-        )
-      }
+    // Undo the activeSandboxCount increment — the caller won't call
+    // cleanupBwrapMountPoints() for a wrap that threw.
+    if (activeSandboxCount > 0) {
+      activeSandboxCount--
     }
-    // Re-throw the original error
     throw error
   }
 }

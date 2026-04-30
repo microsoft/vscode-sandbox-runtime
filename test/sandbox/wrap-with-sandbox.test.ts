@@ -1,12 +1,12 @@
 import { describe, it, expect, beforeAll, afterAll } from 'bun:test'
 import { SandboxManager } from '../../src/sandbox/sandbox-manager.js'
 import type { SandboxRuntimeConfig } from '../../src/sandbox/sandbox-config.js'
-import { getPlatform } from '../../src/utils/platform.js'
 import { wrapCommandWithSandboxLinux } from '../../src/sandbox/linux-sandbox-utils.js'
 import { wrapCommandWithSandboxMacOS } from '../../src/sandbox/macos-sandbox-utils.js'
-import { mkdirSync, rmSync } from 'node:fs'
+import { mkdirSync, rmSync, writeFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
+import { isLinux, isMacOS, isSupportedPlatform } from '../helpers/platform.js'
 
 /**
  * Create a test configuration with network access
@@ -25,32 +25,17 @@ function createTestConfig(): SandboxRuntimeConfig {
   }
 }
 
-function skipIfUnsupportedPlatform(): boolean {
-  const platform = getPlatform()
-  return platform !== 'linux' && platform !== 'macos'
-}
-
-describe('wrapWithSandbox customConfig', () => {
+describe.if(isSupportedPlatform)('wrapWithSandbox customConfig', () => {
   beforeAll(async () => {
-    if (skipIfUnsupportedPlatform()) {
-      return
-    }
     await SandboxManager.initialize(createTestConfig())
   })
 
   afterAll(async () => {
-    if (skipIfUnsupportedPlatform()) {
-      return
-    }
     await SandboxManager.reset()
   })
 
   describe('without customConfig', () => {
     it('uses main config values', async () => {
-      if (skipIfUnsupportedPlatform()) {
-        return
-      }
-
       const command = 'echo hello'
       const wrapped = await SandboxManager.wrapWithSandbox(command)
 
@@ -62,10 +47,6 @@ describe('wrapWithSandbox customConfig', () => {
 
   describe('with customConfig filesystem overrides', () => {
     it('uses custom allowWrite when provided', async () => {
-      if (skipIfUnsupportedPlatform()) {
-        return
-      }
-
       const command = 'echo hello'
       const wrapped = await SandboxManager.wrapWithSandbox(command, undefined, {
         filesystem: {
@@ -81,10 +62,6 @@ describe('wrapWithSandbox customConfig', () => {
     })
 
     it('uses custom denyRead when provided', async () => {
-      if (skipIfUnsupportedPlatform()) {
-        return
-      }
-
       const command = 'cat /etc/passwd'
       const wrapped = await SandboxManager.wrapWithSandbox(command, undefined, {
         filesystem: {
@@ -100,10 +77,6 @@ describe('wrapWithSandbox customConfig', () => {
 
   describe('with customConfig network overrides', () => {
     it('blocks network when allowedDomains is empty', async () => {
-      if (skipIfUnsupportedPlatform()) {
-        return
-      }
-
       const command = 'curl https://example.com'
       const wrapped = await SandboxManager.wrapWithSandbox(command, undefined, {
         network: {
@@ -121,10 +94,6 @@ describe('wrapWithSandbox customConfig', () => {
     })
 
     it('uses main config network when customConfig.network is undefined', async () => {
-      if (skipIfUnsupportedPlatform()) {
-        return
-      }
-
       const command = 'echo hello'
       const wrapped = await SandboxManager.wrapWithSandbox(command, undefined, {
         filesystem: {
@@ -141,10 +110,6 @@ describe('wrapWithSandbox customConfig', () => {
 
   describe('readonly mode simulation', () => {
     it('can create a fully restricted sandbox config', async () => {
-      if (skipIfUnsupportedPlatform()) {
-        return
-      }
-
       const command = 'ls -la'
 
       // This is what BashTool passes for readonly commands
@@ -174,10 +139,6 @@ describe('wrapWithSandbox customConfig', () => {
 
   describe('partial config merging', () => {
     it('only overrides specified filesystem fields', async () => {
-      if (skipIfUnsupportedPlatform()) {
-        return
-      }
-
       const command = 'echo test'
 
       // Only override allowWrite, should use main config for denyRead/denyWrite
@@ -193,10 +154,6 @@ describe('wrapWithSandbox customConfig', () => {
     })
 
     it('only overrides specified network fields', async () => {
-      if (skipIfUnsupportedPlatform()) {
-        return
-      }
-
       const command = 'echo test'
 
       // Only override allowedDomains
@@ -224,146 +181,134 @@ describe('restriction pattern semantics', () => {
   const command = 'echo hello'
 
   describe('no sandboxing needed (early return)', () => {
-    it('returns command unchanged when no restrictions on Linux', async () => {
-      if (getPlatform() !== 'linux') {
-        return
-      }
+    it.if(isLinux)(
+      'returns command unchanged when no restrictions on Linux',
+      async () => {
+        // No network, empty read deny, no write config = no sandboxing
+        const result = await wrapCommandWithSandboxLinux({
+          command,
+          needsNetworkRestriction: false,
+          readConfig: { denyOnly: [] },
+          writeConfig: undefined,
+        })
 
-      // No network, empty read deny, no write config = no sandboxing
-      const result = await wrapCommandWithSandboxLinux({
-        command,
-        needsNetworkRestriction: false,
-        readConfig: { denyOnly: [] },
-        writeConfig: undefined,
-      })
+        expect(result).toBe(command)
+      },
+    )
 
-      expect(result).toBe(command)
-    })
+    it.if(isMacOS)(
+      'returns command unchanged when no restrictions on macOS',
+      () => {
+        // No network, empty read deny, no write config = no sandboxing
+        const result = wrapCommandWithSandboxMacOS({
+          command,
+          needsNetworkRestriction: false,
+          readConfig: { denyOnly: [] },
+          writeConfig: undefined,
+        })
 
-    it('returns command unchanged when no restrictions on macOS', () => {
-      if (getPlatform() !== 'macos') {
-        return
-      }
+        expect(result).toBe(command)
+      },
+    )
 
-      // No network, empty read deny, no write config = no sandboxing
-      const result = wrapCommandWithSandboxMacOS({
-        command,
-        needsNetworkRestriction: false,
-        readConfig: { denyOnly: [] },
-        writeConfig: undefined,
-      })
+    it.if(isLinux)(
+      'returns command unchanged with undefined readConfig on Linux',
+      async () => {
+        const result = await wrapCommandWithSandboxLinux({
+          command,
+          needsNetworkRestriction: false,
+          readConfig: undefined,
+          writeConfig: undefined,
+        })
 
-      expect(result).toBe(command)
-    })
+        expect(result).toBe(command)
+      },
+    )
 
-    it('returns command unchanged with undefined readConfig on Linux', async () => {
-      if (getPlatform() !== 'linux') {
-        return
-      }
+    it.if(isMacOS)(
+      'returns command unchanged with undefined readConfig on macOS',
+      () => {
+        const result = wrapCommandWithSandboxMacOS({
+          command,
+          needsNetworkRestriction: false,
+          readConfig: undefined,
+          writeConfig: undefined,
+        })
 
-      const result = await wrapCommandWithSandboxLinux({
-        command,
-        needsNetworkRestriction: false,
-        readConfig: undefined,
-        writeConfig: undefined,
-      })
-
-      expect(result).toBe(command)
-    })
-
-    it('returns command unchanged with undefined readConfig on macOS', () => {
-      if (getPlatform() !== 'macos') {
-        return
-      }
-
-      const result = wrapCommandWithSandboxMacOS({
-        command,
-        needsNetworkRestriction: false,
-        readConfig: undefined,
-        writeConfig: undefined,
-      })
-
-      expect(result).toBe(command)
-    })
+        expect(result).toBe(command)
+      },
+    )
   })
 
   describe('read restrictions (deny-only pattern)', () => {
-    it('empty denyOnly means no read restrictions on Linux', async () => {
-      if (getPlatform() !== 'linux') {
-        return
-      }
+    it.if(isLinux)(
+      'empty denyOnly means no read restrictions on Linux',
+      async () => {
+        // Only write restrictions, empty read = should sandbox but no read rules
+        const result = await wrapCommandWithSandboxLinux({
+          command,
+          needsNetworkRestriction: false,
+          readConfig: { denyOnly: [] },
+          writeConfig: { allowOnly: ['/tmp'], denyWithinAllow: [] },
+        })
 
-      // Only write restrictions, empty read = should sandbox but no read rules
-      const result = await wrapCommandWithSandboxLinux({
-        command,
-        needsNetworkRestriction: false,
-        readConfig: { denyOnly: [] },
-        writeConfig: { allowOnly: ['/tmp'], denyWithinAllow: [] },
-      })
+        // Should wrap because of write restrictions
+        expect(result).not.toBe(command)
+        expect(result).toContain('bwrap')
+      },
+    )
 
-      // Should wrap because of write restrictions
-      expect(result).not.toBe(command)
-      expect(result).toContain('bwrap')
-    })
+    it.if(isLinux)(
+      'non-empty denyOnly means has read restrictions on Linux',
+      async () => {
+        const result = await wrapCommandWithSandboxLinux({
+          command,
+          needsNetworkRestriction: false,
+          readConfig: { denyOnly: ['/secret'] },
+          writeConfig: undefined,
+        })
 
-    it('non-empty denyOnly means has read restrictions on Linux', async () => {
-      if (getPlatform() !== 'linux') {
-        return
-      }
-
-      const result = await wrapCommandWithSandboxLinux({
-        command,
-        needsNetworkRestriction: false,
-        readConfig: { denyOnly: ['/secret'] },
-        writeConfig: undefined,
-      })
-
-      // Should wrap because of read restrictions
-      expect(result).not.toBe(command)
-      expect(result).toContain('bwrap')
-    })
+        // Should wrap because of read restrictions
+        expect(result).not.toBe(command)
+        expect(result).toContain('bwrap')
+      },
+    )
   })
 
   describe('write restrictions (allow-only pattern)', () => {
-    it('undefined writeConfig means no write restrictions on Linux', async () => {
-      if (getPlatform() !== 'linux') {
-        return
-      }
+    it.if(isLinux)(
+      'undefined writeConfig means no write restrictions on Linux',
+      async () => {
+        // Has read restrictions but no write = should sandbox
+        const result = await wrapCommandWithSandboxLinux({
+          command,
+          needsNetworkRestriction: false,
+          readConfig: { denyOnly: ['/secret'] },
+          writeConfig: undefined,
+        })
 
-      // Has read restrictions but no write = should sandbox
-      const result = await wrapCommandWithSandboxLinux({
-        command,
-        needsNetworkRestriction: false,
-        readConfig: { denyOnly: ['/secret'] },
-        writeConfig: undefined,
-      })
+        expect(result).not.toBe(command)
+      },
+    )
 
-      expect(result).not.toBe(command)
-    })
+    it.if(isLinux)(
+      'empty allowOnly means maximally restrictive (has restrictions) on Linux',
+      async () => {
+        // Empty allowOnly = no writes allowed = has restrictions
+        const result = await wrapCommandWithSandboxLinux({
+          command,
+          needsNetworkRestriction: false,
+          readConfig: { denyOnly: [] },
+          writeConfig: { allowOnly: [], denyWithinAllow: [] },
+        })
 
-    it('empty allowOnly means maximally restrictive (has restrictions) on Linux', async () => {
-      if (getPlatform() !== 'linux') {
-        return
-      }
+        // Should wrap because empty allowOnly is still a restriction
+        expect(result).not.toBe(command)
+        expect(result).toContain('bwrap')
+      },
+    )
 
-      // Empty allowOnly = no writes allowed = has restrictions
-      const result = await wrapCommandWithSandboxLinux({
-        command,
-        needsNetworkRestriction: false,
-        readConfig: { denyOnly: [] },
-        writeConfig: { allowOnly: [], denyWithinAllow: [] },
-      })
-
-      // Should wrap because empty allowOnly is still a restriction
-      expect(result).not.toBe(command)
-      expect(result).toContain('bwrap')
-    })
-
-    it('any writeConfig means has restrictions on macOS', () => {
-      if (getPlatform() !== 'macos') {
-        return
-      }
-
+    it.if(isMacOS)('any writeConfig means has restrictions on macOS', () => {
       const result = wrapCommandWithSandboxMacOS({
         command,
         needsNetworkRestriction: false,
@@ -378,151 +323,145 @@ describe('restriction pattern semantics', () => {
   })
 
   describe('network restrictions', () => {
-    it('needsNetworkRestriction false skips network sandbox on Linux', async () => {
-      if (getPlatform() !== 'linux') {
-        return
-      }
+    it.if(isLinux)(
+      'needsNetworkRestriction false skips network sandbox on Linux',
+      async () => {
+        const result = await wrapCommandWithSandboxLinux({
+          command,
+          needsNetworkRestriction: false,
+          readConfig: { denyOnly: ['/secret'] },
+          writeConfig: undefined,
+        })
 
-      const result = await wrapCommandWithSandboxLinux({
-        command,
-        needsNetworkRestriction: false,
-        readConfig: { denyOnly: ['/secret'] },
-        writeConfig: undefined,
-      })
+        // Should wrap for filesystem but not include network args
+        expect(result).not.toBe(command)
+        expect(result).not.toContain('--unshare-net')
+      },
+    )
 
-      // Should wrap for filesystem but not include network args
-      expect(result).not.toBe(command)
-      expect(result).not.toContain('--unshare-net')
-    })
+    it.if(isMacOS)(
+      'needsNetworkRestriction false skips network sandbox on macOS',
+      () => {
+        const result = wrapCommandWithSandboxMacOS({
+          command,
+          needsNetworkRestriction: false,
+          readConfig: { denyOnly: ['/secret'] },
+          writeConfig: undefined,
+        })
 
-    it('needsNetworkRestriction false skips network sandbox on macOS', () => {
-      if (getPlatform() !== 'macos') {
-        return
-      }
-
-      const result = wrapCommandWithSandboxMacOS({
-        command,
-        needsNetworkRestriction: false,
-        readConfig: { denyOnly: ['/secret'] },
-        writeConfig: undefined,
-      })
-
-      // Should wrap for filesystem
-      expect(result).not.toBe(command)
-      expect(result).toContain('sandbox-exec')
-    })
+        // Should wrap for filesystem
+        expect(result).not.toBe(command)
+        expect(result).toContain('sandbox-exec')
+      },
+    )
 
     // Tests for the empty allowedDomains fix (CVE fix)
     // Empty allowedDomains should block all network, not allow all
-    it('needsNetworkRestriction true without proxy sockets blocks all network on Linux', async () => {
-      if (getPlatform() !== 'linux') {
-        return
-      }
-
-      // Network restriction enabled but no proxy sockets = block all network
-      const result = await wrapCommandWithSandboxLinux({
-        command,
-        needsNetworkRestriction: true,
-        httpSocketPath: undefined, // No proxy available
-        socksSocketPath: undefined, // No proxy available
-        readConfig: { denyOnly: [] },
-        writeConfig: { allowOnly: ['/tmp'], denyWithinAllow: [] },
-      })
-
-      // Should wrap with --unshare-net to block all network
-      expect(result).not.toBe(command)
-      expect(result).toContain('bwrap')
-      expect(result).toContain('--unshare-net')
-      // Should NOT contain proxy-related environment variables since no proxy
-      expect(result).not.toContain('HTTP_PROXY')
-    })
-
-    it('needsNetworkRestriction true without proxy ports blocks all network on macOS', () => {
-      if (getPlatform() !== 'macos') {
-        return
-      }
-
-      // Network restriction enabled but no proxy ports = block all network
-      const result = wrapCommandWithSandboxMacOS({
-        command,
-        needsNetworkRestriction: true,
-        httpProxyPort: undefined, // No proxy available
-        socksProxyPort: undefined, // No proxy available
-        readConfig: { denyOnly: [] },
-        writeConfig: { allowOnly: ['/tmp'], denyWithinAllow: [] },
-      })
-
-      // Should wrap with sandbox-exec
-      expect(result).not.toBe(command)
-      expect(result).toContain('sandbox-exec')
-      // The sandbox profile should NOT contain "(allow network*)" since restrictions are enabled
-      // Note: We can't easily check the profile content, but we verify it doesn't skip sandboxing
-    })
-
-    it('needsNetworkRestriction true with proxy allows filtered network on Linux', async () => {
-      if (getPlatform() !== 'linux') {
-        return
-      }
-
-      // Create temporary socket files for the test
-      const fs = await import('fs')
-      const os = await import('os')
-      const path = await import('path')
-      const tmpDir = os.tmpdir()
-      const httpSocket = path.join(tmpDir, `test-http-${Date.now()}.sock`)
-      const socksSocket = path.join(tmpDir, `test-socks-${Date.now()}.sock`)
-
-      // Create dummy socket files
-      fs.writeFileSync(httpSocket, '')
-      fs.writeFileSync(socksSocket, '')
-
-      try {
+    it.if(isLinux)(
+      'needsNetworkRestriction true without proxy sockets blocks all network on Linux',
+      async () => {
+        // Network restriction enabled but no proxy sockets = block all network
         const result = await wrapCommandWithSandboxLinux({
           command,
           needsNetworkRestriction: true,
-          httpSocketPath: httpSocket,
-          socksSocketPath: socksSocket,
+          httpSocketPath: undefined, // No proxy available
+          socksSocketPath: undefined, // No proxy available
+          readConfig: { denyOnly: [] },
+          writeConfig: { allowOnly: ['/tmp'], denyWithinAllow: [] },
+        })
+
+        // Should wrap with --unshare-net to block all network
+        expect(result).not.toBe(command)
+        expect(result).toContain('bwrap')
+        expect(result).toContain('--unshare-net')
+        // Should NOT contain proxy-related environment variables since no proxy
+        expect(result).not.toContain('HTTP_PROXY')
+      },
+    )
+
+    it.if(isMacOS)(
+      'needsNetworkRestriction true without proxy ports blocks all network on macOS',
+      () => {
+        // Network restriction enabled but no proxy ports = block all network
+        const result = wrapCommandWithSandboxMacOS({
+          command,
+          needsNetworkRestriction: true,
+          httpProxyPort: undefined, // No proxy available
+          socksProxyPort: undefined, // No proxy available
+          readConfig: { denyOnly: [] },
+          writeConfig: { allowOnly: ['/tmp'], denyWithinAllow: [] },
+        })
+
+        // Should wrap with sandbox-exec
+        expect(result).not.toBe(command)
+        expect(result).toContain('sandbox-exec')
+        // The sandbox profile should NOT contain "(allow network*)" since restrictions are enabled
+        // Note: We can't easily check the profile content, but we verify it doesn't skip sandboxing
+      },
+    )
+
+    it.if(isLinux)(
+      'needsNetworkRestriction true with proxy allows filtered network on Linux',
+      async () => {
+        // Create temporary socket files for the test
+        const fs = await import('fs')
+        const os = await import('os')
+        const path = await import('path')
+        const tmpDir = os.tmpdir()
+        const httpSocket = path.join(tmpDir, `test-http-${Date.now()}.sock`)
+        const socksSocket = path.join(tmpDir, `test-socks-${Date.now()}.sock`)
+
+        // Create dummy socket files
+        fs.writeFileSync(httpSocket, '')
+        fs.writeFileSync(socksSocket, '')
+
+        try {
+          const result = await wrapCommandWithSandboxLinux({
+            command,
+            needsNetworkRestriction: true,
+            httpSocketPath: httpSocket,
+            socksSocketPath: socksSocket,
+            httpProxyPort: 3128,
+            socksProxyPort: 1080,
+            readConfig: { denyOnly: [] },
+            writeConfig: { allowOnly: ['/tmp'], denyWithinAllow: [] },
+          })
+
+          // Should wrap with network namespace isolation
+          expect(result).not.toBe(command)
+          expect(result).toContain('bwrap')
+          expect(result).toContain('--unshare-net')
+          // Should bind the socket files
+          expect(result).toContain(httpSocket)
+          expect(result).toContain(socksSocket)
+        } finally {
+          // Cleanup
+          fs.unlinkSync(httpSocket)
+          fs.unlinkSync(socksSocket)
+        }
+      },
+    )
+
+    it.if(isMacOS)(
+      'needsNetworkRestriction true with proxy allows filtered network on macOS',
+      () => {
+        const result = wrapCommandWithSandboxMacOS({
+          command,
+          needsNetworkRestriction: true,
           httpProxyPort: 3128,
           socksProxyPort: 1080,
           readConfig: { denyOnly: [] },
           writeConfig: { allowOnly: ['/tmp'], denyWithinAllow: [] },
         })
 
-        // Should wrap with network namespace isolation
+        // Should wrap with sandbox-exec and proxy env vars
         expect(result).not.toBe(command)
-        expect(result).toContain('bwrap')
-        expect(result).toContain('--unshare-net')
-        // Should bind the socket files
-        expect(result).toContain(httpSocket)
-        expect(result).toContain(socksSocket)
-      } finally {
-        // Cleanup
-        fs.unlinkSync(httpSocket)
-        fs.unlinkSync(socksSocket)
-      }
-    })
-
-    it('needsNetworkRestriction true with proxy allows filtered network on macOS', () => {
-      if (getPlatform() !== 'macos') {
-        return
-      }
-
-      const result = wrapCommandWithSandboxMacOS({
-        command,
-        needsNetworkRestriction: true,
-        httpProxyPort: 3128,
-        socksProxyPort: 1080,
-        readConfig: { denyOnly: [] },
-        writeConfig: { allowOnly: ['/tmp'], denyWithinAllow: [] },
-      })
-
-      // Should wrap with sandbox-exec and proxy env vars
-      expect(result).not.toBe(command)
-      expect(result).toContain('sandbox-exec')
-      // Should set proxy environment variables
-      expect(result).toContain('HTTP_PROXY')
-      expect(result).toContain('HTTPS_PROXY')
-    })
+        expect(result).toContain('sandbox-exec')
+        // Should set proxy environment variables
+        expect(result).toContain('HTTP_PROXY')
+        expect(result).toContain('HTTPS_PROXY')
+      },
+    )
   })
 })
 
@@ -541,9 +480,6 @@ describe('empty allowedDomains network blocking (CVE fix)', () => {
 
   describe('SandboxManager.wrapWithSandbox with empty allowedDomains', () => {
     beforeAll(async () => {
-      if (skipIfUnsupportedPlatform()) {
-        return
-      }
       // Initialize with domains so proxy starts, then test with empty customConfig
       await SandboxManager.initialize({
         network: {
@@ -559,62 +495,61 @@ describe('empty allowedDomains network blocking (CVE fix)', () => {
     })
 
     afterAll(async () => {
-      if (skipIfUnsupportedPlatform()) {
-        return
-      }
       await SandboxManager.reset()
     })
 
-    it('empty allowedDomains in customConfig triggers network restriction on Linux', async () => {
-      if (getPlatform() !== 'linux') {
-        return
-      }
+    it.if(isLinux)(
+      'empty allowedDomains in customConfig triggers network restriction on Linux',
+      async () => {
+        const result = await SandboxManager.wrapWithSandbox(
+          command,
+          undefined,
+          {
+            network: {
+              allowedDomains: [], // Empty = block all network (documented behavior)
+              deniedDomains: [],
+            },
+            filesystem: {
+              denyRead: [],
+              allowWrite: ['/tmp'],
+              denyWrite: [],
+            },
+          },
+        )
 
-      const result = await SandboxManager.wrapWithSandbox(command, undefined, {
-        network: {
-          allowedDomains: [], // Empty = block all network (documented behavior)
-          deniedDomains: [],
-        },
-        filesystem: {
-          denyRead: [],
-          allowWrite: ['/tmp'],
-          denyWrite: [],
-        },
-      })
+        // With the fix, empty allowedDomains should trigger network isolation
+        expect(result).not.toBe(command)
+        expect(result).toContain('bwrap')
+        expect(result).toContain('--unshare-net')
+      },
+    )
 
-      // With the fix, empty allowedDomains should trigger network isolation
-      expect(result).not.toBe(command)
-      expect(result).toContain('bwrap')
-      expect(result).toContain('--unshare-net')
-    })
+    it.if(isMacOS)(
+      'empty allowedDomains in customConfig triggers network restriction on macOS',
+      async () => {
+        const result = await SandboxManager.wrapWithSandbox(
+          command,
+          undefined,
+          {
+            network: {
+              allowedDomains: [], // Empty = block all network (documented behavior)
+              deniedDomains: [],
+            },
+            filesystem: {
+              denyRead: [],
+              allowWrite: ['/tmp'],
+              denyWrite: [],
+            },
+          },
+        )
 
-    it('empty allowedDomains in customConfig triggers network restriction on macOS', async () => {
-      if (getPlatform() !== 'macos') {
-        return
-      }
-
-      const result = await SandboxManager.wrapWithSandbox(command, undefined, {
-        network: {
-          allowedDomains: [], // Empty = block all network (documented behavior)
-          deniedDomains: [],
-        },
-        filesystem: {
-          denyRead: [],
-          allowWrite: ['/tmp'],
-          denyWrite: [],
-        },
-      })
-
-      // With the fix, empty allowedDomains should trigger sandbox
-      expect(result).not.toBe(command)
-      expect(result).toContain('sandbox-exec')
-    })
+        // With the fix, empty allowedDomains should trigger sandbox
+        expect(result).not.toBe(command)
+        expect(result).toContain('sandbox-exec')
+      },
+    )
 
     it('non-empty allowedDomains still works correctly', async () => {
-      if (skipIfUnsupportedPlatform()) {
-        return
-      }
-
       const result = await SandboxManager.wrapWithSandbox(command, undefined, {
         network: {
           allowedDomains: ['example.com'], // Specific domain allowed
@@ -634,10 +569,6 @@ describe('empty allowedDomains network blocking (CVE fix)', () => {
     })
 
     it('undefined network config in customConfig falls back to main config', async () => {
-      if (skipIfUnsupportedPlatform()) {
-        return
-      }
-
       const result = await SandboxManager.wrapWithSandbox(command, undefined, {
         // No network config - should fall back to main config which has example.com
         filesystem: {
@@ -659,10 +590,6 @@ describe('allowWrite glob suffix handling', () => {
   const command = 'echo hello'
 
   it('allowWrite with /** suffix includes path in sandbox command', async () => {
-    if (skipIfUnsupportedPlatform()) {
-      return
-    }
-
     const testDir = join(tmpdir(), `srt-test-glob-allow-${Date.now()}`)
     mkdirSync(testDir, { recursive: true })
 
@@ -688,10 +615,6 @@ describe('allowWrite glob suffix handling', () => {
   })
 
   it('denyWrite with /** suffix within allowed parent includes both paths', async () => {
-    if (skipIfUnsupportedPlatform()) {
-      return
-    }
-
     const parentDir = join(tmpdir(), `srt-test-glob-deny-${Date.now()}`)
     const childDir = join(parentDir, 'denied')
     mkdirSync(childDir, { recursive: true })
@@ -717,4 +640,148 @@ describe('allowWrite glob suffix handling', () => {
       rmSync(parentDir, { recursive: true, force: true })
     }
   })
+
+  // Regression: two denyWrite entries that converge to the same path after
+  // normalizePathForSandbox() produced a duplicate --ro-bind /dev/null <dest>.
+  // Second bind finds a char device at <dest>; bwrap's ensure_file() doesn't
+  // short-circuit on S_ISCHR and falls through to creat() on a read-only mount.
+  it.if(isLinux)(
+    'dedups denyWrite entries that normalize to the same path (Linux)',
+    async () => {
+      const parentDir = join(tmpdir(), `srt-test-dup-deny-${Date.now()}`)
+      const childFile = join(parentDir, 'dup.txt')
+      mkdirSync(parentDir, { recursive: true })
+      writeFileSync(childFile, '')
+
+      try {
+        await SandboxManager.reset()
+        await SandboxManager.initialize({
+          network: { allowedDomains: [], deniedDomains: [] },
+          filesystem: {
+            denyRead: [],
+            allowWrite: [parentDir],
+            // Trailing slash and bare form both realpath to childFile
+            denyWrite: [childFile, childFile + '/'],
+          },
+        })
+
+        const result = await SandboxManager.wrapWithSandbox(command)
+
+        // One --ro-bind <path> <path> contains the path twice (src + dest).
+        // Without dedup this was 4 occurrences (two binds).
+        const occurrences = result.split(childFile).length - 1
+        expect(occurrences).toBe(2)
+      } finally {
+        await SandboxManager.reset()
+        rmSync(parentDir, { recursive: true, force: true })
+      }
+    },
+  )
+
+  // Regression: #190 reordered denyWrite after denyRead so .git/hooks ro-binds
+  // survive a tmpfs over an ancestor. But denyWrite's --ro-bind <host> <host>
+  // now lands after denyRead's --ro-bind /dev/null <host>, undoing the mask
+  // when the same file is in both lists.
+  it.if(isLinux)(
+    'does not let denyWrite unmask a denyRead /dev/null bind (Linux)',
+    async () => {
+      const parentDir = join(tmpdir(), `srt-test-unmask-${Date.now()}`)
+      const secret = join(parentDir, 'secret.txt')
+      mkdirSync(parentDir, { recursive: true })
+      writeFileSync(secret, '')
+
+      try {
+        await SandboxManager.reset()
+        await SandboxManager.initialize({
+          network: { allowedDomains: [], deniedDomains: [] },
+          filesystem: {
+            denyRead: [secret],
+            allowWrite: [parentDir],
+            denyWrite: [secret],
+          },
+        })
+
+        const result = await SandboxManager.wrapWithSandbox(command)
+
+        // The /dev/null mask is what we want; the host-file bind is what we don't.
+        expect(result).toContain(`--ro-bind /dev/null ${secret}`)
+        expect(result).not.toContain(`--ro-bind ${secret} ${secret}`)
+      } finally {
+        await SandboxManager.reset()
+        rmSync(parentDir, { recursive: true, force: true })
+      }
+    },
+  )
+
+  // A file listed in denyRead should stay denied even if allowRead covers its
+  // parent directory. Before this change, startsWith(allowPath + '/') matched
+  // and the file-deny was silently skipped.
+  it.if(isLinux)(
+    'file-level denyRead survives a parent-directory allowRead (Linux)',
+    async () => {
+      const parentDir = join(tmpdir(), `srt-test-file-deny-${Date.now()}`)
+      const secret = join(parentDir, '.env')
+      mkdirSync(parentDir, { recursive: true })
+      writeFileSync(secret, '')
+
+      try {
+        await SandboxManager.reset()
+        await SandboxManager.initialize({
+          network: { allowedDomains: [], deniedDomains: [] },
+          filesystem: {
+            denyRead: [secret],
+            allowRead: [parentDir],
+            allowWrite: [parentDir],
+            denyWrite: [],
+          },
+        })
+
+        const result = await SandboxManager.wrapWithSandbox(command)
+
+        expect(result).toContain(`--ro-bind /dev/null ${secret}`)
+      } finally {
+        await SandboxManager.reset()
+        rmSync(parentDir, { recursive: true, force: true })
+      }
+    },
+  )
+
+  // denyRead entries are sorted shallow-first before mounting, so a file-deny
+  // listed before its ancestor dir-deny still lands on top of the ancestor's
+  // tmpfs + re-allow binds.
+  it.if(isLinux)(
+    'file-deny survives ancestor dir-deny listed after it in denyRead (Linux)',
+    async () => {
+      const parentDir = join(tmpdir(), `srt-test-order-${Date.now()}`)
+      const projectDir = join(parentDir, 'project')
+      const envFile = join(projectDir, '.env')
+      mkdirSync(projectDir, { recursive: true })
+      writeFileSync(envFile, '')
+
+      try {
+        await SandboxManager.reset()
+        await SandboxManager.initialize({
+          network: { allowedDomains: [], deniedDomains: [] },
+          filesystem: {
+            // File deliberately listed before the dir that contains it
+            denyRead: [envFile, parentDir],
+            allowRead: [projectDir],
+            allowWrite: [projectDir],
+            denyWrite: [],
+          },
+        })
+
+        const result = await SandboxManager.wrapWithSandbox(command)
+
+        // The /dev/null mask must come after the tmpfs + ro-bind in arg order.
+        const tmpfsAt = result.indexOf(`--tmpfs ${parentDir}`)
+        const maskAt = result.indexOf(`--ro-bind /dev/null ${envFile}`)
+        expect(tmpfsAt).toBeGreaterThan(-1)
+        expect(maskAt).toBeGreaterThan(tmpfsAt)
+      } finally {
+        await SandboxManager.reset()
+        rmSync(parentDir, { recursive: true, force: true })
+      }
+    },
+  )
 })

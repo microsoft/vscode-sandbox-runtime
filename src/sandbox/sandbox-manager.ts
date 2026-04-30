@@ -3,10 +3,9 @@ import { createSocksProxyServer } from './socks-proxy.js'
 import type { SocksProxyWrapper } from './socks-proxy.js'
 import { logForDebugging } from '../utils/debug.js'
 import { whichSync } from '../utils/which.js'
-import { cloneDeep } from 'lodash-es'
 import { getPlatform, getWslVersion } from '../utils/platform.js'
 import * as fs from 'fs'
-import type { SandboxRuntimeConfig } from './sandbox-config.js'
+import type { SandboxRuntimeConfig, SeccompConfig } from './sandbox-config.js'
 import type {
   SandboxAskCallback,
   FsReadRestrictionConfig,
@@ -32,6 +31,15 @@ import {
   expandGlobPattern,
 } from './sandbox-utils.js'
 import { SandboxViolationStore } from './sandbox-violation-store.js'
+import {
+  canonicalizeHost,
+  isValidHost,
+  redactUrl,
+  resolveParentProxy,
+  stripBrackets,
+} from './parent-proxy.js'
+import { isIP } from 'node:net'
+import type { ResolvedParentProxy } from './parent-proxy.js'
 import { EOL } from 'node:os'
 
 interface HostNetworkManagerContext {
@@ -51,6 +59,7 @@ let managerContext: HostNetworkManagerContext | undefined
 let initializationPromise: Promise<HostNetworkManagerContext> | undefined
 let cleanupRegistered = false
 let logMonitorShutdown: (() => void) | undefined
+let parentProxy: ResolvedParentProxy | undefined
 const sandboxViolationStore = new SandboxViolationStore()
 
 // ============================================================================
@@ -74,15 +83,20 @@ function registerCleanup(): void {
 }
 
 function matchesDomainPattern(hostname: string, pattern: string): boolean {
-  // Support wildcard patterns like *.example.com
-  // This matches any subdomain but not the base domain itself
+  const h = hostname.toLowerCase()
+  // Support wildcard patterns like *.example.com. Never apply wildcard
+  // suffix matching to IP literals — an IPv6 zone-ID payload like
+  // `::ffff:1.2.3.4%x.allowed.com` would otherwise pass .endsWith() while
+  // the OS connects to the bare IP. isValidHost already rejects `%`, but
+  // we refuse here too for defence in depth.
   if (pattern.startsWith('*.')) {
-    const baseDomain = pattern.substring(2) // Remove '*.'
-    return hostname.toLowerCase().endsWith('.' + baseDomain.toLowerCase())
+    if (isIP(stripBrackets(h))) return false
+    const baseDomain = pattern.substring(2).toLowerCase()
+    return h.endsWith('.' + baseDomain)
   }
 
   // Exact match for non-wildcard patterns
-  return hostname.toLowerCase() === pattern.toLowerCase()
+  return h === pattern.toLowerCase()
 }
 
 async function filterNetworkRequest(
@@ -95,9 +109,27 @@ async function filterNetworkRequest(
     return false
   }
 
+  // Reject hosts containing control characters before pattern matching.
+  // `matchesDomainPattern` uses string suffix matching which is trivially
+  // fooled by e.g. `evil.com\x00.allowed.com` — the null byte passes
+  // `.endsWith()` but truncates at the libc DNS layer. The SOCKS path is the
+  // main exposure (DOMAINNAME is unvalidated bytes); HTTP is protected by
+  // llhttp/URL parsing, but we check here for defence in depth.
+  if (!isValidHost(host)) {
+    logForDebugging(`Denying malformed host: ${JSON.stringify(host)}:${port}`, {
+      level: 'error',
+    })
+    return false
+  }
+
+  // Canonicalize so string comparisons match what getaddrinfo() will dial.
+  // Without this, inet_aton shorthand like `2852039166` (= 169.254.169.254)
+  // or `127.1` slips past a denylist entry for the dotted-decimal form.
+  const canonicalHost = canonicalizeHost(host) ?? host
+
   // Check denied domains first
   for (const deniedDomain of config.network.deniedDomains) {
-    if (matchesDomainPattern(host, deniedDomain)) {
+    if (matchesDomainPattern(canonicalHost, deniedDomain)) {
       logForDebugging(`Denied by config rule: ${host}:${port}`)
       return false
     }
@@ -105,7 +137,7 @@ async function filterNetworkRequest(
 
   // Check allowed domains
   for (const allowedDomain of config.network.allowedDomains) {
-    if (matchesDomainPattern(host, allowedDomain)) {
+    if (matchesDomainPattern(canonicalHost, allowedDomain)) {
       logForDebugging(`Allowed by config rule: ${host}:${port}`)
       return true
     }
@@ -164,6 +196,7 @@ async function startHttpProxyServer(
     filter: (port: number, host: string) =>
       filterNetworkRequest(port, host, sandboxAskCallback),
     getMitmSocketPath,
+    parentProxy,
   })
 
   return new Promise<number>((resolve, reject) => {
@@ -196,6 +229,7 @@ async function startSocksProxyServer(
   socksProxyServer = createSocksProxyServer({
     filter: (port: number, host: string) =>
       filterNetworkRequest(port, host, sandboxAskCallback),
+    parentProxy,
   })
 
   return new Promise<number>((resolve, reject) => {
@@ -232,6 +266,16 @@ async function initialize(
 
   // Store config for use by other functions
   config = runtimeConfig
+
+  // Resolve parent/upstream proxy from config or HTTP_PROXY env before we
+  // start our own listeners (which will later shadow those vars in the child).
+  parentProxy = resolveParentProxy(runtimeConfig.network.parentProxy)
+  if (parentProxy) {
+    logForDebugging(
+      `Parent proxy configured: http=${redactUrl(parentProxy.httpUrl)} ` +
+        `https=${redactUrl(parentProxy.httpsUrl)}`,
+    )
+  }
 
   // Check dependencies
   const deps = checkDependencies()
@@ -358,7 +402,7 @@ function checkDependencies(ripgrepConfig?: {
 
 function getFsReadConfig(): FsReadRestrictionConfig {
   if (!config) {
-    return { denyOnly: [] }
+    return { denyOnly: [], allowWithinDeny: [] }
   }
 
   const denyPaths: string[] = []
@@ -376,8 +420,24 @@ function getFsReadConfig(): FsReadRestrictionConfig {
     }
   }
 
+  // Process allowRead paths (re-allow within denied regions)
+  const allowPaths: string[] = []
+  for (const p of config.filesystem.allowRead ?? []) {
+    const stripped = removeTrailingGlobSuffix(p)
+    if (getPlatform() === 'linux' && containsGlobChars(stripped)) {
+      const expanded = expandGlobPattern(p)
+      logForDebugging(
+        `[Sandbox] Expanded allowRead glob pattern "${p}" to ${expanded.length} paths on Linux`,
+      )
+      allowPaths.push(...expanded)
+    } else {
+      allowPaths.push(stripped)
+    }
+  }
+
   return {
     denyOnly: denyPaths,
+    allowWithinDeny: allowPaths,
   }
 }
 
@@ -443,6 +503,10 @@ function getAllowLocalBinding(): boolean | undefined {
   return config?.network?.allowLocalBinding
 }
 
+function getAllowMachLookup(): string[] | undefined {
+  return config?.network?.allowMachLookup
+}
+
 function getIgnoreViolations(): Record<string, string[]> | undefined {
   return config?.ignoreViolations
 }
@@ -467,9 +531,7 @@ function getAllowGitConfig(): boolean {
   return config?.filesystem?.allowGitConfig ?? false
 }
 
-function getSeccompConfig():
-  | { bpfPath?: string; applyPath?: string }
-  | undefined {
+function getSeccompConfig(): SeccompConfig | undefined {
   return config?.seccomp
 }
 
@@ -555,8 +617,20 @@ async function wrapWithSandbox(
       expandedDenyRead.push(stripped)
     }
   }
+  const rawAllowRead =
+    customConfig?.filesystem?.allowRead ?? config?.filesystem.allowRead ?? []
+  const expandedAllowRead: string[] = []
+  for (const p of rawAllowRead) {
+    const stripped = removeTrailingGlobSuffix(p)
+    if (getPlatform() === 'linux' && containsGlobChars(stripped)) {
+      expandedAllowRead.push(...expandGlobPattern(p))
+    } else {
+      expandedAllowRead.push(stripped)
+    }
+  }
   const readConfig = {
     denyOnly: expandedDenyRead,
+    allowWithinDeny: expandedAllowRead,
   }
 
   // Check if network config is specified - this determines if we need network restrictions
@@ -600,6 +674,7 @@ async function wrapWithSandbox(
         allowUnixSockets: getAllowUnixSockets(),
         allowAllUnixSockets: getAllowAllUnixSockets(),
         allowLocalBinding: getAllowLocalBinding(),
+        allowMachLookup: getAllowMachLookup(),
         ignoreViolations: getIgnoreViolations(),
         allowPty,
         allowGitConfig: getAllowGitConfig(),
@@ -658,7 +733,12 @@ function getConfig(): SandboxRuntimeConfig | undefined {
  */
 function updateConfig(newConfig: SandboxRuntimeConfig): void {
   // Deep clone the config to avoid mutations
-  config = cloneDeep(newConfig)
+  config = structuredClone(newConfig)
+  // Re-resolve parent proxy so hot-reload picks up changes. Note: the proxy
+  // servers capture `parentProxy` by value at creation, so changes here take
+  // effect only on re-initialize. This keeps the state consistent for the
+  // next initialize() call.
+  parentProxy = resolveParentProxy(newConfig.network.parentProxy)
   logForDebugging('Sandbox configuration updated')
 }
 
@@ -677,8 +757,9 @@ function cleanupAfterCommand(): void {
 }
 
 async function reset(): Promise<void> {
-  // Clean up any leftover bwrap mount points
-  cleanupAfterCommand()
+  // Clean up any leftover bwrap mount points. Force past the
+  // active-sandbox counter — reset() means the session is over.
+  cleanupBwrapMountPoints({ force: true })
 
   // Stop log monitor
   if (logMonitorShutdown) {
@@ -839,6 +920,7 @@ async function reset(): Promise<void> {
   socksProxyServer = undefined
   managerContext = undefined
   initializationPromise = undefined
+  parentProxy = undefined
 }
 
 function getSandboxViolationStore() {
@@ -928,6 +1010,7 @@ export interface ISandboxManager {
   getNetworkRestrictionConfig(): NetworkRestrictionConfig
   getAllowUnixSockets(): string[] | undefined
   getAllowLocalBinding(): boolean | undefined
+  getAllowMachLookup(): string[] | undefined
   getIgnoreViolations(): Record<string, string[]> | undefined
   getEnableWeakerNestedSandbox(): boolean | undefined
   getProxyPort(): number | undefined
@@ -968,6 +1051,7 @@ export const SandboxManager: ISandboxManager = {
   getNetworkRestrictionConfig,
   getAllowUnixSockets,
   getAllowLocalBinding,
+  getAllowMachLookup,
   getIgnoreViolations,
   getEnableWeakerNestedSandbox,
   getProxyPort,

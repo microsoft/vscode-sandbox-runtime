@@ -224,6 +224,41 @@ describe('Config Validation', () => {
     }
   })
 
+  test('should accept valid allowMachLookup entries', () => {
+    const config = {
+      network: {
+        allowedDomains: [],
+        deniedDomains: [],
+        allowMachLookup: [
+          '2BUA8C4S2C.com.1password.*',
+          'com.apple.CoreSimulator.CoreSimulatorService',
+          '*',
+        ],
+      },
+      filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+    }
+
+    const result = SandboxRuntimeConfigSchema.safeParse(config)
+    expect(result.success).toBe(true)
+  })
+
+  test.each(['com.*.foo', 'com.example.**'])(
+    'should reject allowMachLookup entry with non-trailing wildcard: %s',
+    entry => {
+      const config = {
+        network: {
+          allowedDomains: [],
+          deniedDomains: [],
+          allowMachLookup: [entry],
+        },
+        filesystem: { denyRead: [], allowWrite: [], denyWrite: [] },
+      }
+
+      const result = SandboxRuntimeConfigSchema.safeParse(config)
+      expect(result.success).toBe(false)
+    },
+  )
+
   test('should use default ripgrep command when not specified', () => {
     const config = {
       network: {

@@ -337,12 +337,19 @@ export function generateProxyEnvVars(
     envVars.push(`ALL_PROXY=socks5h://localhost:${socksProxyPort}`)
     envVars.push(`all_proxy=socks5h://localhost:${socksProxyPort}`)
 
-    // Configure Git to use SSH through SOCKS proxy (platform-aware)
-    if (getPlatform() === 'macos') {
-      // macOS has nc available
-      // Note: No outer quotes - bwrap --setenv sets the value directly without shell interpretation
+    // Configure Git to use SSH through the proxy so DNS resolution happens outside the sandbox
+    const platform = getPlatform()
+    if (platform === 'macos') {
+      // macOS: use BSD nc SOCKS5 proxy support (-X 5 -x)
       envVars.push(
         `GIT_SSH_COMMAND=ssh -o ProxyCommand='nc -X 5 -x localhost:${socksProxyPort} %h %p'`,
+      )
+    } else if (platform === 'linux' && httpProxyPort) {
+      // Linux: use socat HTTP CONNECT via the HTTP proxy bridge.
+      // socat is already a required Linux sandbox dependency, and PROXY: is
+      // portable across all socat versions (unlike SOCKS5-CONNECT which needs >= 1.8.0).
+      envVars.push(
+        `GIT_SSH_COMMAND=ssh -o ProxyCommand='socat - PROXY:localhost:%h:%p,proxyport=${httpProxyPort}'`,
       )
     }
 

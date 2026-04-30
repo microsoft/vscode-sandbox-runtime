@@ -1,53 +1,32 @@
-import { describe, test, expect, beforeEach, afterAll, mock } from 'bun:test'
+import { describe, test, expect, beforeEach, afterEach, spyOn } from 'bun:test'
+import * as which from '../../src/utils/which.js'
+import * as seccomp from '../../src/sandbox/generate-seccomp-filter.js'
+import {
+  checkLinuxDependencies,
+  getLinuxDependencyStatus,
+} from '../../src/sandbox/linux-sandbox-utils.js'
 
-// Mock state - these control what the mocked functions return
-let mockBwrapInstalled = true
-let mockSocatInstalled = true
-let mockBpfPath: string | null = null
-let mockApplyPath: string | null = null
+// Spies set up in beforeEach, torn down in afterEach. Each test overrides
+// just the piece it's exercising. spyOn patches the export binding, so
+// linux-sandbox-utils' own imports see the replacement.
+let whichSpy: ReturnType<typeof spyOn>
+let applySpy: ReturnType<typeof spyOn>
 
-// Store original Bun.which to restore later
-const originalBunWhich = globalThis.Bun.which
+beforeEach(() => {
+  whichSpy = spyOn(which, 'whichSync').mockImplementation(
+    (bin: string) => `/usr/bin/${bin}`,
+  )
+  applySpy = spyOn(seccomp, 'getApplySeccompBinaryPath').mockReturnValue(
+    '/path/to/apply-seccomp',
+  )
+})
 
-// Mock Bun.which directly - this avoids mock.module which affects other test files
-globalThis.Bun.which = ((bin: string): string | null => {
-  if (bin === 'bwrap') {
-    return mockBwrapInstalled ? '/usr/bin/bwrap' : null
-  }
-  if (bin === 'socat') {
-    return mockSocatInstalled ? '/usr/bin/socat' : null
-  }
-  // For other binaries, use the original implementation
-  return originalBunWhich(bin)
-}) as typeof globalThis.Bun.which
-
-// Mock seccomp path functions - controls whether seccomp binaries are "found"
-void mock.module('../../src/sandbox/generate-seccomp-filter.js', () => ({
-  getPreGeneratedBpfPath: () => mockBpfPath,
-  getApplySeccompBinaryPath: () => mockApplyPath,
-  generateSeccompFilter: () => null,
-  cleanupSeccompFilter: () => {},
-}))
-
-// Dynamic import AFTER mocking - this is required for mocks to take effect
-const { checkLinuxDependencies, getLinuxDependencyStatus } = await import(
-  '../../src/sandbox/linux-sandbox-utils.js'
-)
-
-// Restore original Bun.which after all tests in this file
-afterAll(() => {
-  globalThis.Bun.which = originalBunWhich
+afterEach(() => {
+  whichSpy.mockRestore()
+  applySpy.mockRestore()
 })
 
 describe('checkLinuxDependencies', () => {
-  // Reset all mocks to "everything installed" state before each test
-  beforeEach(() => {
-    mockBwrapInstalled = true
-    mockSocatInstalled = true
-    mockBpfPath = '/path/to/filter.bpf'
-    mockApplyPath = '/path/to/apply-seccomp'
-  })
-
   test('returns no errors or warnings when all dependencies present', () => {
     const result = checkLinuxDependencies()
 
@@ -56,7 +35,9 @@ describe('checkLinuxDependencies', () => {
   })
 
   test('returns error when bwrap missing', () => {
-    mockBwrapInstalled = false
+    whichSpy.mockImplementation((bin: string) =>
+      bin === 'bwrap' ? null : `/usr/bin/${bin}`,
+    )
 
     const result = checkLinuxDependencies()
 
@@ -65,7 +46,9 @@ describe('checkLinuxDependencies', () => {
   })
 
   test('returns error when socat missing', () => {
-    mockSocatInstalled = false
+    whichSpy.mockImplementation((bin: string) =>
+      bin === 'socat' ? null : `/usr/bin/${bin}`,
+    )
 
     const result = checkLinuxDependencies()
 
@@ -74,8 +57,7 @@ describe('checkLinuxDependencies', () => {
   })
 
   test('returns multiple errors when both bwrap and socat missing', () => {
-    mockBwrapInstalled = false
-    mockSocatInstalled = false
+    whichSpy.mockReturnValue(null)
 
     const result = checkLinuxDependencies()
 
@@ -84,9 +66,8 @@ describe('checkLinuxDependencies', () => {
     expect(result.errors.length).toBe(2)
   })
 
-  test('returns warning (not error) when seccomp missing', () => {
-    mockBpfPath = null
-    mockApplyPath = null
+  test('returns warning when apply-seccomp missing', () => {
+    applySpy.mockReturnValue(null)
 
     const result = checkLinuxDependencies()
 
@@ -95,81 +76,75 @@ describe('checkLinuxDependencies', () => {
     )
   })
 
-  test('returns warning when only bpf file present (no apply binary)', () => {
-    mockBpfPath = '/path/to/filter.bpf'
-    mockApplyPath = null
+  test('passes custom applyPath through to the resolver', () => {
+    checkLinuxDependencies({ applyPath: '/custom/apply' })
 
-    const result = checkLinuxDependencies()
-
-    expect(result.errors).toEqual([])
-    expect(result.warnings.length).toBe(1)
+    expect(applySpy).toHaveBeenCalledWith('/custom/apply')
   })
 
-  // This verifies the config parameter is actually passed through
-  test('uses custom seccomp paths when provided', () => {
-    // Default paths return null (not found)
-    mockBpfPath = null
-    mockApplyPath = null
+  test('argv0 mode: no seccomp warning even when binary lookup would fail', () => {
+    applySpy.mockReturnValue(null)
 
-    // But we're passing custom paths - the mock ignores them,
-    // so this still returns warnings. The point is it doesn't crash
-    // and the structure is correct. Real path validation happens in the mock.
     const result = checkLinuxDependencies({
-      bpfPath: '/custom/path.bpf',
-      applyPath: '/custom/apply',
+      argv0: 'apply-seccomp',
+      applyPath: '/proc/self/fd/3',
     })
 
-    expect(Array.isArray(result.errors)).toBe(true)
-    expect(Array.isArray(result.warnings)).toBe(true)
+    expect(result.warnings).toEqual([])
+    expect(applySpy).not.toHaveBeenCalled()
   })
 })
 
 describe('getLinuxDependencyStatus', () => {
-  beforeEach(() => {
-    mockBwrapInstalled = true
-    mockSocatInstalled = true
-    mockBpfPath = '/path/to/filter.bpf'
-    mockApplyPath = '/path/to/apply-seccomp'
-  })
-
-  // All deps installed = all flags true
   test('reports all available when everything installed', () => {
     const status = getLinuxDependencyStatus()
 
     expect(status.hasBwrap).toBe(true)
     expect(status.hasSocat).toBe(true)
-    expect(status.hasSeccompBpf).toBe(true)
     expect(status.hasSeccompApply).toBe(true)
   })
 
-  // Each missing dep should show as false independently
   test('reports bwrap unavailable when not installed', () => {
-    mockBwrapInstalled = false
+    whichSpy.mockImplementation((bin: string) =>
+      bin === 'bwrap' ? null : `/usr/bin/${bin}`,
+    )
 
     const status = getLinuxDependencyStatus()
 
     expect(status.hasBwrap).toBe(false)
-    expect(status.hasSocat).toBe(true) // others unaffected
+    expect(status.hasSocat).toBe(true)
   })
 
   test('reports socat unavailable when not installed', () => {
-    mockSocatInstalled = false
+    whichSpy.mockImplementation((bin: string) =>
+      bin === 'socat' ? null : `/usr/bin/${bin}`,
+    )
 
     const status = getLinuxDependencyStatus()
 
     expect(status.hasSocat).toBe(false)
-    expect(status.hasBwrap).toBe(true) // others unaffected
+    expect(status.hasBwrap).toBe(true)
   })
 
-  test('reports seccomp unavailable when files missing', () => {
-    mockBpfPath = null
-    mockApplyPath = null
+  test('reports seccomp unavailable when apply binary missing', () => {
+    applySpy.mockReturnValue(null)
 
     const status = getLinuxDependencyStatus()
 
-    expect(status.hasSeccompBpf).toBe(false)
     expect(status.hasSeccompApply).toBe(false)
-    expect(status.hasBwrap).toBe(true) // others unaffected
+    expect(status.hasBwrap).toBe(true)
     expect(status.hasSocat).toBe(true)
+  })
+
+  test('argv0 mode: hasSeccompApply is true without touching disk', () => {
+    applySpy.mockReturnValue(null)
+
+    const status = getLinuxDependencyStatus({
+      argv0: 'apply-seccomp',
+      applyPath: '/does/not/exist',
+    })
+
+    expect(status.hasSeccompApply).toBe(true)
+    expect(applySpy).not.toHaveBeenCalled()
   })
 })

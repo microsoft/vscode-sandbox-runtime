@@ -6,7 +6,6 @@ import { homedir } from 'node:os'
 import { logForDebugging } from '../utils/debug.js'
 
 // Cache for path lookups (key: explicit path or empty string, value: resolved path or null)
-const bpfPathCache = new Map<string, string | null>()
 const applySeccompPathCache = new Map<string, string | null>()
 
 // Cache for global npm paths (computed once per process)
@@ -141,96 +140,6 @@ function getLocalSeccompPaths(filename: string): string[] {
 }
 
 /**
- * Get the path to a pre-generated BPF filter file from the vendor directory
- * Returns the path if it exists, null otherwise
- *
- * Pre-generated BPF files are organized by architecture:
- * - vendor/seccomp/{x64,arm64}/unix-block.bpf
- *
- * Tries multiple paths for resilience:
- * 0. Explicit path provided via parameter (checked first if provided)
- * 1. vendor/seccomp/{arch}/unix-block.bpf (bundled - when bundled into consuming packages)
- * 2. ../../vendor/seccomp/{arch}/unix-block.bpf (package root - standard npm installs)
- * 3. ../vendor/seccomp/{arch}/unix-block.bpf (dist/vendor - for bundlers)
- * 4. Global npm install (if seccompBinaryPath not provided) - for native builds
- *
- * @param seccompBinaryPath - Optional explicit path to the BPF filter file. If provided and
- *   exists, it will be used. If not provided, falls back to searching local paths and then
- *   global npm install (for native builds where vendor directory isn't bundled).
- */
-export function getPreGeneratedBpfPath(
-  seccompBinaryPath?: string,
-): string | null {
-  const cacheKey = seccompBinaryPath ?? ''
-  if (bpfPathCache.has(cacheKey)) {
-    return bpfPathCache.get(cacheKey)!
-  }
-
-  const result = findBpfPath(seccompBinaryPath)
-  bpfPathCache.set(cacheKey, result)
-  return result
-}
-
-// NOTE: This is a slow operation (synchronous fs lookups + execSync). Ensure calls
-// are memoized at the top level rather than invoked repeatedly.
-function findBpfPath(seccompBinaryPath?: string): string | null {
-  // Check explicit path first (highest priority)
-  if (seccompBinaryPath) {
-    if (fs.existsSync(seccompBinaryPath)) {
-      logForDebugging(
-        `[SeccompFilter] Using BPF filter from explicit path: ${seccompBinaryPath}`,
-      )
-      return seccompBinaryPath
-    }
-    logForDebugging(
-      `[SeccompFilter] Explicit path provided but file not found: ${seccompBinaryPath}`,
-    )
-  }
-
-  const arch = getVendorArchitecture()
-  if (!arch) {
-    logForDebugging(
-      `[SeccompFilter] Cannot find pre-generated BPF filter: unsupported architecture ${process.arch}`,
-    )
-    return null
-  }
-
-  logForDebugging(`[SeccompFilter] Detected architecture: ${arch}`)
-
-  // Check local paths first (bundled or package install)
-  for (const bpfPath of getLocalSeccompPaths('unix-block.bpf')) {
-    if (fs.existsSync(bpfPath)) {
-      logForDebugging(
-        `[SeccompFilter] Found pre-generated BPF filter: ${bpfPath} (${arch})`,
-      )
-      return bpfPath
-    }
-  }
-
-  // Fallback: check global npm install (for native builds without bundled vendor)
-  for (const globalBase of getGlobalNpmPaths()) {
-    const bpfPath = join(
-      globalBase,
-      'vendor',
-      'seccomp',
-      arch,
-      'unix-block.bpf',
-    )
-    if (fs.existsSync(bpfPath)) {
-      logForDebugging(
-        `[SeccompFilter] Found pre-generated BPF filter in global install: ${bpfPath} (${arch})`,
-      )
-      return bpfPath
-    }
-  }
-
-  logForDebugging(
-    `[SeccompFilter] Pre-generated BPF filter not found in any expected location (${arch})`,
-  )
-  return null
-}
-
-/**
  * Get the path to the apply-seccomp binary from the vendor directory
  * Returns the path if it exists, null otherwise
  *
@@ -318,55 +227,4 @@ function findApplySeccompPath(seccompBinaryPath?: string): string | null {
     `[SeccompFilter] apply-seccomp binary not found in any expected location (${arch})`,
   )
   return null
-}
-
-/**
- * Get the path to a pre-generated seccomp BPF filter that blocks Unix domain socket creation
- * Returns the path to the BPF filter file, or null if not available
- *
- * The filter blocks socket(AF_UNIX, ...) syscalls while allowing all other syscalls.
- * This prevents creation of new Unix domain socket file descriptors.
- *
- * Security scope:
- * - Blocks: socket(AF_UNIX, ...) syscall (creating new Unix socket FDs)
- * - Does NOT block: Operations on inherited Unix socket FDs (bind, connect, sendto, etc.)
- * - Does NOT block: Unix socket FDs passed via SCM_RIGHTS
- * - For most sandboxing scenarios, blocking socket creation is sufficient
- *
- * Note: This blocks ALL Unix socket creation, regardless of path. The allowUnixSockets
- * configuration is not supported on Linux due to seccomp-bpf limitations (it cannot
- * read user-space memory to inspect socket paths).
- *
- * Requirements:
- * - Pre-generated BPF filters included for x64 and ARM64 only
- * - Other architectures are not supported
- *
- * @param seccompBinaryPath - Optional explicit path to the BPF filter file
- * @returns Path to the pre-generated BPF filter file, or null if not available
- */
-export function generateSeccompFilter(
-  seccompBinaryPath?: string,
-): string | null {
-  const preGeneratedBpf = getPreGeneratedBpfPath(seccompBinaryPath)
-  if (preGeneratedBpf) {
-    logForDebugging('[SeccompFilter] Using pre-generated BPF filter')
-    return preGeneratedBpf
-  }
-
-  logForDebugging(
-    '[SeccompFilter] Pre-generated BPF filter not available for this architecture. ' +
-      'Only x64 and arm64 are supported.',
-    { level: 'error' },
-  )
-  return null
-}
-
-/**
- * Clean up a seccomp filter file
- * Since we only use pre-generated BPF files from vendor/, this is a no-op.
- * Pre-generated files are never deleted.
- * Kept for backward compatibility with existing code that calls it.
- */
-export function cleanupSeccompFilter(_filterPath: string): void {
-  // No-op: pre-generated BPF files are never cleaned up
 }

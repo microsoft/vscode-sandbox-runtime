@@ -1,17 +1,21 @@
 // Filesystem restriction configs (internal structures built from permission rules)
 
 /**
- * Read restriction config using a "deny-only" pattern.
+ * Read restriction config using a "deny then allow-back" pattern.
  *
  * Semantics:
  * - `undefined` = no restrictions (allow all reads)
  * - `{denyOnly: []}` = no restrictions (empty deny list = allow all reads)
  * - `{denyOnly: [...paths]}` = deny reads from these paths, allow all others
+ * - `{denyOnly: [...paths], allowWithinDeny: [...paths]}` = deny reads from
+ *   denyOnly paths, but re-allow reads within allowWithinDeny paths.
+ *   allowWithinDeny takes precedence over denyOnly (most-specific rule wins).
  *
  * This is maximally permissive by default - only explicitly denied paths are blocked.
  */
 export interface FsReadRestrictionConfig {
   denyOnly: string[]
+  allowWithinDeny?: string[]
 }
 
 /**

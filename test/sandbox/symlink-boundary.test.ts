@@ -2,7 +2,6 @@ import { describe, it, expect, beforeEach, afterEach } from 'bun:test'
 import { spawnSync } from 'node:child_process'
 import { existsSync, mkdirSync, rmSync, unlinkSync, lstatSync } from 'node:fs'
 import { join } from 'node:path'
-import { getPlatform } from '../../src/utils/platform.js'
 import { wrapCommandWithSandboxMacOS } from '../../src/sandbox/macos-sandbox-utils.js'
 import {
   isSymlinkOutsideBoundary,
@@ -19,9 +18,7 @@ import type { FsWriteRestrictionConfig } from '../../src/sandbox/sandbox-schemas
  * preserved rather than the resolved path.
  */
 
-function skipIfNotMacOS(): boolean {
-  return getPlatform() !== 'macos'
-}
+import { isMacOS } from '../helpers/platform.js'
 
 /**
  * Safely remove /tmp/claude if it exists (file, directory, or symlink)
@@ -44,10 +41,10 @@ function cleanupTmpClaude(): void {
   }
 }
 
-describe('macOS Seatbelt Symlink Boundary Validation', () => {
+describe.if(isMacOS)('macOS Seatbelt Symlink Boundary Validation', () => {
   // Use unique test directories per run
-  // IMPORTANT: Use /private/tmp (not os.tmpdir() which is /var/folders/...)
-  // because /var/folders is automatically allowed by the sandbox via TMPDIR parent rule
+  // Use /private/tmp (not os.tmpdir()) so test paths are outside any
+  // default-allowed write location
   const TEST_ID = Date.now()
   const TEST_BASE_DIR = `/private/tmp/symlink-boundary-test-${TEST_ID}`
   const WORKSPACE_DIR = join(TEST_BASE_DIR, 'workspace')
@@ -56,10 +53,6 @@ describe('macOS Seatbelt Symlink Boundary Validation', () => {
   const TEST_CONTENT = 'TEST_CONTENT'
 
   beforeEach(() => {
-    if (skipIfNotMacOS()) {
-      return
-    }
-
     // Clean up any existing /tmp/claude symlink from previous runs
     cleanupTmpClaude()
 
@@ -71,10 +64,6 @@ describe('macOS Seatbelt Symlink Boundary Validation', () => {
   })
 
   afterEach(() => {
-    if (skipIfNotMacOS()) {
-      return
-    }
-
     // Clean up /tmp/claude
     cleanupTmpClaude()
 
@@ -89,10 +78,6 @@ describe('macOS Seatbelt Symlink Boundary Validation', () => {
 
   describe('Symlink Boundary Enforcement', () => {
     it('should preserve original path when symlink points to root', () => {
-      if (skipIfNotMacOS()) {
-        return
-      }
-
       // Step 1: Verify sandbox correctly blocks writes outside workspace
       console.log('\n=== Step 1: Initial write attempt (should be blocked) ===')
 
@@ -172,10 +157,6 @@ describe('macOS Seatbelt Symlink Boundary Validation', () => {
     })
 
     it('should block writes outside workspace when /tmp/claude does not exist', () => {
-      if (skipIfNotMacOS()) {
-        return
-      }
-
       // Ensure /tmp/claude doesn't exist
       cleanupTmpClaude()
       expect(existsSync('/tmp/claude')).toBe(false)
@@ -204,10 +185,6 @@ describe('macOS Seatbelt Symlink Boundary Validation', () => {
     })
 
     it('should block writes outside workspace when /tmp/claude is a regular directory', () => {
-      if (skipIfNotMacOS()) {
-        return
-      }
-
       // Create /tmp/claude as a regular directory
       cleanupTmpClaude()
       mkdirSync('/tmp/claude', { recursive: true })
@@ -240,10 +217,6 @@ describe('macOS Seatbelt Symlink Boundary Validation', () => {
     })
 
     it('should block writes via symlink traversal path', () => {
-      if (skipIfNotMacOS()) {
-        return
-      }
-
       // Create symlink /tmp/claude -> /
       cleanupTmpClaude()
       spawnSync('ln', ['-s', '/', '/tmp/claude'], { encoding: 'utf8' })
@@ -285,10 +258,6 @@ describe('macOS Seatbelt Symlink Boundary Validation', () => {
 
   describe('isSymlinkOutsideBoundary Integration', () => {
     it('should reject symlink resolution that broadens scope', () => {
-      if (skipIfNotMacOS()) {
-        return
-      }
-
       // Create symlink pointing to root
       cleanupTmpClaude()
       spawnSync('ln', ['-s', '/', '/tmp/claude'], { encoding: 'utf8' })
@@ -424,7 +393,7 @@ describe('isSymlinkOutsideBoundary Unit Tests', () => {
 /**
  * Tests for glob pattern symlink boundary validation
  */
-describe('Glob Pattern Symlink Boundary', () => {
+describe.if(isMacOS)('Glob Pattern Symlink Boundary', () => {
   function cleanupTmpClaude(): void {
     const paths = ['/tmp/claude', '/private/tmp/claude']
     for (const p of paths) {
@@ -442,10 +411,6 @@ describe('Glob Pattern Symlink Boundary', () => {
   }
 
   it('should preserve original glob pattern when base directory symlink points to root', () => {
-    if (getPlatform() !== 'macos') {
-      return
-    }
-
     // Clean up and create symlink
     cleanupTmpClaude()
     spawnSync('ln', ['-s', '/', '/tmp/claude'], { encoding: 'utf8' })
@@ -462,10 +427,6 @@ describe('Glob Pattern Symlink Boundary', () => {
   })
 
   it('should preserve original glob pattern when base directory symlink points to parent', () => {
-    if (getPlatform() !== 'macos') {
-      return
-    }
-
     // Clean up and create symlink pointing to /tmp (parent)
     cleanupTmpClaude()
     spawnSync('ln', ['-s', '/tmp', '/tmp/claude'], { encoding: 'utf8' })

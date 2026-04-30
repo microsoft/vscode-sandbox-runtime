@@ -115,7 +115,7 @@ Both filesystem and network isolation are required for effective sandboxing. Wit
 
 **Filesystem Isolation** enforces read and write restrictions:
 
-- **Read** (deny-only pattern): By default, read access is allowed everywhere. You can deny specific paths (e.g., `~/.ssh`). An empty deny list means full read access.
+- **Read** (deny-then-allow pattern): By default, read access is allowed everywhere. You can deny broad regions (e.g., `/Users`) and then re-allow specific paths within them (e.g., `.`). `allowRead` takes precedence over `denyRead` — the opposite of write, where `denyWrite` takes precedence over `allowWrite`.
 - **Write** (allow-only pattern): By default, write access is denied everywhere. You must explicitly allow paths (e.g., `.`, `/tmp`). An empty allow list means no write access.
 
 **Network Isolation** (allow-only pattern): By default, all network access is denied. You must explicitly allow domains. An empty allowedDomains list means no network access. Network traffic is routed through proxy servers running on the host:
@@ -262,6 +262,7 @@ srt --settings /path/to/srt-settings.json <command>
   },
   "filesystem": {
     "denyRead": ["~/.ssh"],
+    "allowRead": [],
     "allowWrite": [".", "src/", "test/", "/tmp"],
     "denyWrite": [".env", "config/production.json"]
   },
@@ -287,10 +288,10 @@ Uses an **allow-only pattern** - all network access is denied by default.
 
 **Unix Socket Settings** (platform-specific behavior):
 
-| Setting | macOS | Linux |
-|---------|-------|-------|
-| `allowUnixSockets: string[]` | Allowlist of socket paths | *Ignored* (seccomp can't filter by path) |
-| `allowAllUnixSockets: boolean` | Allow all sockets | Disable seccomp blocking |
+| Setting                        | macOS                     | Linux                                    |
+| ------------------------------ | ------------------------- | ---------------------------------------- |
+| `allowUnixSockets: string[]`   | Allowlist of socket paths | _Ignored_ (seccomp can't filter by path) |
+| `allowAllUnixSockets: boolean` | Allow all sockets         | Disable seccomp blocking                 |
 
 Unix sockets are **blocked by default** on both platforms.
 
@@ -301,9 +302,10 @@ Unix sockets are **blocked by default** on both platforms.
 
 Uses two different patterns:
 
-**Read restrictions** (deny-only pattern) - all reads allowed by default:
+**Read restrictions** (deny-then-allow pattern) - all reads allowed by default:
 
 - `filesystem.denyRead` - Array of paths to deny read access. Empty array = full read access.
+- `filesystem.allowRead` - Array of paths to re-allow read access within denied regions (takes precedence over denyRead). **Note:** this is the opposite of write, where `denyWrite` takes precedence over `allowWrite`.
 
 **Write restrictions** (allow-only pattern) - all writes denied by default:
 
@@ -324,6 +326,7 @@ Examples:
 - `"allowWrite": ["src/"]` - Allow write to entire `src/` directory
 - `"allowWrite": ["src/**/*.ts"]` - Allow write to all `.ts` files in `src/` and subdirectories
 - `"denyRead": ["~/.ssh"]` - Deny read to SSH directory
+- `"denyRead": ["/Users"], "allowRead": ["."]` - Deny read to all of `/Users`, but re-allow the current directory
 - `"denyWrite": [".env"]` - Deny write to `.env` file (even if current directory is allowed)
 
 **Path Syntax (Linux):**
@@ -332,6 +335,7 @@ Examples:
 
 - `"allowWrite": ["src/"]` - Allow write to `src/` directory
 - `"denyRead": ["/home/user/.ssh"]` - Deny read to SSH directory
+- `"denyRead": ["/home"], "allowRead": ["."]` - Deny read to all of `/home`, but re-allow the current directory
 
 **All platforms:**
 
@@ -383,6 +387,25 @@ Examples:
 }
 ```
 
+**Workspace-only filesystem access** (deny reads outside the workspace):
+
+```json
+{
+  "network": {
+    "allowedDomains": [],
+    "deniedDomains": []
+  },
+  "filesystem": {
+    "denyRead": ["/Users"],
+    "allowRead": ["."],
+    "allowWrite": ["."],
+    "denyWrite": []
+  }
+}
+```
+
+This denies reading anything under `/Users` (or `/home` on Linux), then re-allows the current working directory. System paths (`/usr`, `/lib`, etc.) remain readable.
+
 ### Common Issues and Tips
 
 **Running Jest:** Use `--no-watchman` flag to avoid sandbox violations:
@@ -416,6 +439,14 @@ Watchman accesses files outside the sandbox boundaries, which will trigger permi
   - Fedora: `dnf install ripgrep`
   - Arch: `pacman -S ripgrep`
 
+**Ubuntu 24.04+ note:** These releases enable `kernel.apparmor_restrict_unprivileged_userns` by default, which allows `unshare(CLONE_NEWUSER)` but strips capabilities from the resulting namespace. Both bubblewrap and the seccomp isolation layer need capability-bearing user namespaces. Disable the restriction with:
+
+```bash
+sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+```
+
+or add an AppArmor profile that grants `userns` to the relevant binaries.
+
 **Optional Linux dependencies (for seccomp fallback):**
 
 The package includes pre-generated seccomp BPF filters for x86-64 and arm architectures. These dependencies are only needed if you are on a different architecture where pre-generated filters are not available:
@@ -441,14 +472,8 @@ npm install
 # Build the project
 npm run build
 
-# Build seccomp binaries (requires Docker)
-npm run build:seccomp
-
 # Run tests
 npm test
-
-# Run integration tests
-npm run test:integration
 
 # Type checking
 npm run typecheck
@@ -462,18 +487,7 @@ npm run format
 
 ### Building Seccomp Binaries
 
-The pre-generated BPF filters are included in the repository, but you can rebuild them if needed:
-
-```bash
-npm run build:seccomp
-```
-
-This script uses Docker to cross-compile seccomp binaries for multiple architectures:
-
-- x64 (x86-64)
-- arm64 (aarch64)
-
-The script builds static generator binaries, generates the BPF filters (~104 bytes each), and stores them in `vendor/seccomp/x64/` and `vendor/seccomp/arm64/`. The generator binaries are removed to keep the package size small.
+The BPF filter and `apply-seccomp` loader are compiled from C source in `vendor/seccomp-src/` via `npm run build:seccomp` (Linux only; needs `gcc` and `libseccomp-dev`). CI runs it before tests on each Linux arch, and the release workflow builds both arches and bundles them into the published package.
 
 ## Implementation Details
 
@@ -500,17 +514,18 @@ Filesystem restrictions are enforced at the OS level:
 
 **Default filesystem permissions:**
 
-- **Read** (deny-only): Allowed everywhere by default. You can deny specific paths.
+- **Read** (deny-then-allow): Allowed everywhere by default. You can deny broad regions, then re-allow specific paths within them. `allowRead` takes precedence over `denyRead`.
 
   - Example: `denyRead: ["~/.ssh"]` to block access to SSH keys
+  - Example: `denyRead: ["/Users"], allowRead: ["."]` to block all of `/Users` except the workspace
   - Empty `denyRead: []` = full read access (nothing denied)
 
 - **Write** (allow-only): Denied everywhere by default. You must explicitly allow paths.
   - Example: `allowWrite: [".", "/tmp"]` to allow writes to current directory and /tmp
   - Empty `allowWrite: []` = no write access (nothing allowed)
-  - `denyWrite` creates exceptions within allowed paths
+  - `denyWrite` creates exceptions within allowed paths (deny takes precedence)
 
-This model lets you start with broad read access but maximally restricted write access, then explicitly open the holes you need.
+**Precedence is intentionally opposite for reads vs writes:** `allowRead` overrides `denyRead`, while `denyWrite` overrides `allowWrite`. This lets you carve out readable regions within denied areas, and carve out protected regions within writable areas.
 
 ### Mandatory Deny Paths (Auto-Protected Files)
 
@@ -562,20 +577,23 @@ On Linux, the sandbox uses **seccomp BPF (Berkeley Packet Filter)** to block Uni
 
 **How it works:**
 
-1. **Pre-generated BPF filters**: The package includes pre-compiled BPF filters for different architectures (x64, ARM64). These are ~104 bytes each and stored in `vendor/seccomp/`. The filters are architecture-specific but libc-independent, so they work with both glibc and musl.
+1. **Baked-in BPF filter**: The package ships a static `apply-seccomp` binary for x64 and arm64 with the seccomp BPF filter compiled in. The filter is architecture-specific but libc-independent, so the binary works with both glibc and musl.
 
-2. **Runtime detection**: The sandbox automatically detects your system's architecture and loads the appropriate pre-generated BPF filter.
+2. **Runtime detection**: The sandbox automatically detects your system's architecture and uses the matching `apply-seccomp` binary.
 
 3. **Syscall filtering**: The BPF filter intercepts the `socket()` syscall and blocks creation of `AF_UNIX` sockets by returning `EPERM`. This prevents sandboxed code from creating new Unix domain sockets.
 
 4. **Two-stage application using apply-seccomp binary**:
    - Outer bwrap creates the sandbox with filesystem, network, and PID namespace restrictions
    - Network bridging processes (socat) start inside the sandbox (need Unix sockets)
-   - apply-seccomp binary applies the seccomp filter via `prctl()`
-   - apply-seccomp execs the user command with seccomp active
+   - apply-seccomp creates a nested user+PID+mount namespace and remounts `/proc`
+   - Inside the nested namespace, apply-seccomp acts as PID 1 (non-dumpable init/reaper)
+   - apply-seccomp forks, applies the seccomp filter via `prctl()`, and execs the user command
    - User command runs with all sandbox restrictions plus Unix socket creation blocking
 
-**Security limitations**: The filter only blocks `socket(AF_UNIX, ...)` syscalls. It does not prevent operations on Unix socket file descriptors inherited from parent processes or passed via `SCM_RIGHTS`. For most sandboxing scenarios, blocking socket creation is sufficient to prevent unauthorized IPC.
+**PID namespace isolation**: The nested PID namespace ensures the user command cannot see or address any process that runs without the seccomp filter (bwrap's init, the shell wrapper, or the socat helpers). This keeps the seccomp boundary intact regardless of `kernel.yama.ptrace_scope`, since unfiltered helpers are not reachable via `ptrace` or `/proc/N/mem`. The inner PID 1 sets `PR_SET_DUMPABLE=0` so it is not ptraceable either. If nested namespace creation fails, apply-seccomp aborts rather than running without isolation.
+
+**Security limitations**: The filter blocks `socket(AF_UNIX, ...)` and the `io_uring_setup`/`io_uring_enter`/`io_uring_register` syscalls (the latter three because `IORING_OP_SOCKET` on Linux 5.19+ would otherwise bypass the `socket()` rule). It does not prevent operations on Unix socket file descriptors inherited from parent processes or passed via `SCM_RIGHTS`. For most sandboxing scenarios, blocking socket creation is sufficient to prevent unauthorized IPC.
 
 **Zero runtime dependencies**: Pre-built static apply-seccomp binaries and pre-generated BPF filters are included for x64 and arm64 architectures. No compilation tools or external dependencies required at runtime.
 

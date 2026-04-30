@@ -2,3 +2,5 @@ node_modules
 dist
 .claude
 .DS_Store
+vendor/seccomp/x64/
+vendor/seccomp/arm64/
