@@ -29,7 +29,7 @@ extends:
     npmPackages:
       - name: vscode-sandbox-runtime
         buildSteps:
-          - script: |
+          - bash: |
               set -euo pipefail
               git submodule update --init
               # Install npm dependencies and required system packages
@@ -43,7 +43,7 @@ extends:
               bun --version
             displayName: Install dependencies
 
-          - script: |
+          - bash: |
               npm run clean && npm run build
               npm run build:seccomp
             displayName: Build
