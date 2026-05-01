@@ -13,7 +13,7 @@ resources:
   repositories:
     - repository: templates
       type: github
-      name: microsoft/vscode-sandbox-runtime
+      name: microsoft/vscode-engineering
       ref: main
       endpoint: Monaco
 
