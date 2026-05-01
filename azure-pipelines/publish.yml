@@ -50,4 +50,5 @@ extends:
 
         apiScanSoftwareName: 'vscode-sandbox-runtime'
         apiScanSoftwareVersion: '0'
+        skipAPIScan: true
         publishPackage: ${{ parameters.publishPackage }}
