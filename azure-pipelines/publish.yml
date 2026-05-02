@@ -1,0 +1,54 @@
+name: $(Date:yyyyMMdd)$(Rev:.r)
+
+trigger:
+  branches:
+    include:
+      - main
+pr: none
+
+variables:
+  BUN_VERSION: '1.3.1'
+
+resources:
+  repositories:
+    - repository: templates
+      type: github
+      name: microsoft/vscode-engineering
+      ref: main
+      endpoint: Monaco
+
+parameters:
+  - name: publishPackage
+    displayName: 🚀 Publish vscode-sandbox-runtime
+    type: boolean
+    default: false
+
+extends:
+  template: azure-pipelines/npm-package/pipeline.yml@templates
+  parameters:
+    npmPackages:
+      - name: vscode-sandbox-runtime
+        buildSteps:
+          - bash: |
+              set -euo pipefail
+              git submodule update --init
+              # Install npm dependencies and required system packages
+              npm ci
+              # install required system packages for seccomp
+              sudo apt-get update && sudo apt-get install -y gcc libseccomp-dev
+              # install bun
+              curl -fsSL https://bun.sh/install | bash -s "bun-v$(BUN_VERSION)"
+              echo "##vso[task.prependpath]$HOME/.bun/bin"
+              export PATH="$HOME/.bun/bin:$PATH"
+              bun --version
+            displayName: Install dependencies
+
+          - bash: |
+              npm run clean && npm run build
+              npm run build:seccomp
+            displayName: Build
+
+        apiScanSoftwareName: 'vscode-sandbox-runtime'
+        apiScanSoftwareVersion: '0'
+        skipAPIScan: true
+        publishPackage: ${{ parameters.publishPackage }}
