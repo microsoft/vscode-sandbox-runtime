@@ -48,6 +48,7 @@ extends:
               npm run build:seccomp
             displayName: Build
 
+
         apiScanSoftwareName: 'vscode-sandbox-runtime'
         apiScanSoftwareVersion: '0'
         skipAPIScan: true
