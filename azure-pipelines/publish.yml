@@ -48,6 +48,13 @@ extends:
               npm run build:seccomp
             displayName: Build
 
+          - bash: |
+              set -euo pipefail
+              npm run lint:check
+              npm run typecheck
+              npm test
+            displayName: Test
+
         apiScanSoftwareName: 'vscode-sandbox-runtime'
         apiScanSoftwareVersion: '0'
         skipAPIScan: true
