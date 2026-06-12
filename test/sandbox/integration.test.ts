@@ -1,16 +1,17 @@
 import { describe, it, expect, beforeAll, afterAll } from 'bun:test'
-import { spawnSync } from 'node:child_process'
 import {
   existsSync,
   unlinkSync,
   mkdirSync,
   rmSync,
   readFileSync,
+  writeFileSync,
 } from 'node:fs'
 import type { Server } from 'node:net'
 import { tmpdir } from 'node:os'
 import { join } from 'node:path'
 import { isLinux } from '../helpers/platform.js'
+import { spawnAsync } from '../helpers/spawn.js'
 import { SandboxManager } from '../../src/sandbox/sandbox-manager.js'
 import type { SandboxRuntimeConfig } from '../../src/sandbox/sandbox-config.js'
 import { getApplySeccompBinaryPath } from '../../src/sandbox/generate-seccomp-filter.js'
@@ -131,7 +132,7 @@ describe.if(isLinux)('Sandbox Integration Tests', () => {
           `echo "Test message" | nc -U ${TEST_SOCKET_PATH}`,
         )
 
-        const result = spawnSync(command, {
+        const result = await spawnAsync(command, {
           shell: true,
           encoding: 'utf8',
           timeout: 5000,
@@ -154,7 +155,7 @@ describe.if(isLinux)('Sandbox Integration Tests', () => {
           'curl -s http://blocked-domain.example',
         )
 
-        const result = spawnSync(command, {
+        const result = await spawnAsync(command, {
           shell: true,
           encoding: 'utf8',
           timeout: 5000,
@@ -170,7 +171,7 @@ describe.if(isLinux)('Sandbox Integration Tests', () => {
           'curl -s --show-error --max-time 2 https://www.anthropic.com',
         )
 
-        const result = spawnSync(command, {
+        const result = await spawnAsync(command, {
           shell: true,
           encoding: 'utf8',
           timeout: 3000,
@@ -194,7 +195,7 @@ describe.if(isLinux)('Sandbox Integration Tests', () => {
           'curl -s http://example.com',
         )
 
-        const result = spawnSync(command, {
+        const result = await spawnAsync(command, {
           shell: true,
           encoding: 'utf8',
           timeout: 10000,
@@ -220,7 +221,7 @@ describe.if(isLinux)('Sandbox Integration Tests', () => {
           `echo "should fail" > ${testFile}`,
         )
 
-        const result = spawnSync(command, {
+        const result = await spawnAsync(command, {
           shell: true,
           encoding: 'utf8',
           cwd: TEST_DIR,
@@ -251,7 +252,7 @@ describe.if(isLinux)('Sandbox Integration Tests', () => {
           `echo "${testContent}" > allowed-write.txt`,
         )
 
-        const result = spawnSync(command, {
+        const result = await spawnAsync(command, {
           shell: true,
           encoding: 'utf8',
           cwd: TEST_DIR,
@@ -288,7 +289,7 @@ describe.if(isLinux)('Sandbox Integration Tests', () => {
           'head -n 5 ~/.bashrc',
         )
 
-        const result = spawnSync(command, {
+        const result = await spawnAsync(command, {
           shell: true,
           encoding: 'utf8',
           timeout: 5000,
@@ -324,7 +325,7 @@ describe.if(isLinux)('Sandbox Integration Tests', () => {
           allowAllUnixSockets: false, // Enable seccomp
         })
 
-        const result = spawnSync(command, {
+        const result = await spawnAsync(command, {
           shell: true,
           encoding: 'utf8',
           cwd: TEST_DIR,
@@ -360,7 +361,7 @@ describe.if(isLinux)('Sandbox Integration Tests', () => {
           'echo "Hello from sandbox"',
         )
 
-        const result = spawnSync(command, {
+        const result = await spawnAsync(command, {
           shell: true,
           encoding: 'utf8',
           timeout: 5000,
@@ -375,7 +376,7 @@ describe.if(isLinux)('Sandbox Integration Tests', () => {
           'echo "line1\nline2\nline3" | grep line2',
         )
 
-        const result = spawnSync(command, {
+        const result = await spawnAsync(command, {
           shell: true,
           encoding: 'utf8',
           timeout: 5000,
@@ -390,7 +391,7 @@ describe.if(isLinux)('Sandbox Integration Tests', () => {
     describe('Shell Selection (binShell parameter)', () => {
       it('should execute commands with zsh when binShell is specified', async () => {
         // Check if zsh is available
-        const zshCheck = spawnSync('which zsh', {
+        const zshCheck = await spawnAsync('which zsh', {
           shell: true,
           encoding: 'utf8',
         })
@@ -405,7 +406,7 @@ describe.if(isLinux)('Sandbox Integration Tests', () => {
           'zsh',
         )
 
-        const result = spawnSync(command, {
+        const result = await spawnAsync(command, {
           shell: true,
           encoding: 'utf8',
           timeout: 5000,
@@ -418,7 +419,7 @@ describe.if(isLinux)('Sandbox Integration Tests', () => {
 
       it('should use zsh syntax successfully with binShell=zsh', async () => {
         // Check if zsh is available
-        const zshCheck = spawnSync('which zsh', {
+        const zshCheck = await spawnAsync('which zsh', {
           shell: true,
           encoding: 'utf8',
         })
@@ -433,7 +434,7 @@ describe.if(isLinux)('Sandbox Integration Tests', () => {
           'zsh',
         )
 
-        const result = spawnSync(command, {
+        const result = await spawnAsync(command, {
           shell: true,
           encoding: 'utf8',
           timeout: 5000,
@@ -449,7 +450,7 @@ describe.if(isLinux)('Sandbox Integration Tests', () => {
           'echo "Shell: $BASH_VERSION"',
         )
 
-        const result = spawnSync(command, {
+        const result = await spawnAsync(command, {
           shell: true,
           encoding: 'utf8',
           timeout: 5000,
@@ -469,7 +470,7 @@ describe.if(isLinux)('Sandbox Integration Tests', () => {
           'ls /proc | grep -E "^[0-9]+$" | wc -l',
         )
 
-        const result = spawnSync(command, {
+        const result = await spawnAsync(command, {
           shell: true,
           encoding: 'utf8',
           timeout: 5000,
@@ -494,7 +495,7 @@ describe.if(isLinux)('Sandbox Integration Tests', () => {
           `ln -s ${targetOutside} ${linkInAllowed} 2>&1 && echo "escaped" > ${linkInAllowed} 2>&1`,
         )
 
-        const result = spawnSync(command, {
+        const result = await spawnAsync(command, {
           shell: true,
           encoding: 'utf8',
           cwd: TEST_DIR,
@@ -531,7 +532,7 @@ describe.if(isLinux)('Sandbox Integration Tests', () => {
         )
 
         const startTime = Date.now()
-        spawnSync(command, {
+        await spawnAsync(command, {
           shell: true,
           encoding: 'utf8',
           cwd: TEST_DIR,
@@ -577,11 +578,15 @@ describe.if(isLinux)('Sandbox Integration Tests', () => {
 
         // Use timeout to kill the sandbox after 1 second
         // The inner command would take 10 seconds to complete
-        const result = spawnSync('timeout', ['1', 'bash', '-c', command], {
-          encoding: 'utf8',
-          cwd: TEST_DIR,
-          timeout: 5000,
-        })
+        const result = await spawnAsync(
+          'timeout',
+          ['1', 'bash', '-c', command],
+          {
+            encoding: 'utf8',
+            cwd: TEST_DIR,
+            timeout: 5000,
+          },
+        )
 
         // timeout returns 124 when it kills the process
         expect(result.status).toBe(124)
@@ -619,7 +624,7 @@ describe.if(isLinux)('Sandbox Integration Tests', () => {
         )
 
         // Kill after 0.5 seconds
-        spawnSync('timeout', ['0.5', 'bash', '-c', command], {
+        await spawnAsync('timeout', ['0.5', 'bash', '-c', command], {
           encoding: 'utf8',
           cwd: TEST_DIR,
           timeout: 3000,
@@ -629,7 +634,7 @@ describe.if(isLinux)('Sandbox Integration Tests', () => {
         await new Promise(resolve => setTimeout(resolve, 1500))
 
         // Check for orphan processes with our marker
-        const psResult = spawnSync(
+        const psResult = await spawnAsync(
           'bash',
           ['-c', `ps aux | grep "${uniqueMarker}" | grep -v grep || true`],
           {
@@ -657,7 +662,7 @@ describe.if(isLinux)('Sandbox Integration Tests', () => {
           `cp /bin/bash ${setuidTest} 2>&1 && chmod u+s ${setuidTest} 2>&1 && ${setuidTest} -c "id -u" 2>&1`,
         )
 
-        const result1 = spawnSync(command1, {
+        const result1 = await spawnAsync(command1, {
           shell: true,
           encoding: 'utf8',
           cwd: TEST_DIR,
@@ -673,7 +678,7 @@ describe.if(isLinux)('Sandbox Integration Tests', () => {
           'sudo -n echo "elevated" 2>&1 || su -c "echo elevated" 2>&1 || echo "commands blocked"',
         )
 
-        const result2 = spawnSync(command2, {
+        const result2 = await spawnAsync(command2, {
           shell: true,
           encoding: 'utf8',
           timeout: 5000,
@@ -703,7 +708,7 @@ describe.if(isLinux)('Sandbox Integration Tests', () => {
           'curl -s --show-error --max-time 2 --connect-timeout 2 https://blocked-domain.example 2>&1 || echo "curl_failed"',
         )
 
-        const result1 = spawnSync(command1, {
+        const result1 = await spawnAsync(command1, {
           shell: true,
           encoding: 'utf8',
           timeout: 4000,
@@ -725,7 +730,7 @@ describe.if(isLinux)('Sandbox Integration Tests', () => {
           'curl -s --show-error --max-time 2 http://blocked-domain.example:8080 2>&1',
         )
 
-        const result2 = spawnSync(command2, {
+        const result2 = await spawnAsync(command2, {
           shell: true,
           encoding: 'utf8',
           timeout: 3000,
@@ -741,7 +746,7 @@ describe.if(isLinux)('Sandbox Integration Tests', () => {
           'curl -s --max-time 2 http://1.1.1.1 2>&1', // Cloudflare DNS
         )
 
-        const result3 = spawnSync(command3, {
+        const result3 = await spawnAsync(command3, {
           shell: true,
           encoding: 'utf8',
           timeout: 3000,
@@ -757,7 +762,7 @@ describe.if(isLinux)('Sandbox Integration Tests', () => {
           'curl -s --max-time 5 https://example.com 2>&1',
         )
 
-        const result4 = spawnSync(command4, {
+        const result4 = await spawnAsync(command4, {
           shell: true,
           encoding: 'utf8',
           timeout: 10000,
@@ -773,83 +778,84 @@ describe.if(isLinux)('Sandbox Integration Tests', () => {
       })
 
       it('should enforce wildcard domain pattern matching correctly', async () => {
-        // Reset and reinitialize with wildcard pattern
-        await SandboxManager.reset()
-        await SandboxManager.initialize({
+        // Swap allowedDomains in-place rather than reset()+initialize().
+        // The proxy filter reads the live config on every request, so this
+        // takes effect immediately and lets us keep the bridge/proxy that
+        // every other test in this describe already uses.
+        const baseConfig = createTestConfig(TEST_DIR)
+        SandboxManager.updateConfig({
+          ...baseConfig,
           network: {
+            ...baseConfig.network,
             allowedDomains: ['*.github.com', 'example.com'],
-            deniedDomains: [],
-          },
-          filesystem: {
-            denyRead: [],
-            allowWrite: [],
-            denyWrite: [],
           },
         })
+        try {
+          // Test 1: Subdomain should match wildcard. We only assert the
+          // proxy did NOT block it — the upstream response is irrelevant —
+          // so cap the request tightly.
+          const command1 = await SandboxManager.wrapWithSandbox(
+            'curl -s --connect-timeout 2 --max-time 2 http://api.github.com 2>&1 | head -20',
+          )
 
-        // Test 1: Subdomain should match wildcard
-        const command1 = await SandboxManager.wrapWithSandbox(
-          'curl -s --max-time 3 http://api.github.com 2>&1 | head -20',
-        )
+          const result1 = await spawnAsync(command1, {
+            shell: true,
+            encoding: 'utf8',
+            timeout: 3000,
+          })
 
-        const result1 = spawnSync(command1, {
-          shell: true,
-          encoding: 'utf8',
-          timeout: 5000,
-        })
+          // Should NOT be blocked - api.github.com matches *.github.com
+          const output1 = result1.stdout.toLowerCase()
+          expect(output1).not.toContain('blocked by network allowlist')
 
-        // Should NOT be blocked - api.github.com matches *.github.com
-        const output1 = result1.stdout.toLowerCase()
-        expect(output1).not.toContain('blocked by network allowlist')
+          // Test 2: Base domain should NOT match wildcard (*.github.com doesn't match github.com)
+          const command2 = await SandboxManager.wrapWithSandbox(
+            'curl -s --max-time 2 http://github.com 2>&1',
+          )
 
-        // Test 2: Base domain should NOT match wildcard (*.github.com doesn't match github.com)
-        const command2 = await SandboxManager.wrapWithSandbox(
-          'curl -s --max-time 2 http://github.com 2>&1',
-        )
+          const result2 = await spawnAsync(command2, {
+            shell: true,
+            encoding: 'utf8',
+            timeout: 3000,
+          })
 
-        const result2 = spawnSync(command2, {
-          shell: true,
-          encoding: 'utf8',
-          timeout: 3000,
-        })
+          // Should be blocked - github.com does NOT match *.github.com
+          const output2 = result2.stdout.toLowerCase()
+          expect(output2).toContain('blocked by network allowlist')
 
-        // Should be blocked - github.com does NOT match *.github.com
-        const output2 = result2.stdout.toLowerCase()
-        expect(output2).toContain('blocked by network allowlist')
+          // Test 3: Malicious lookalike domain should NOT match
+          const command3 = await SandboxManager.wrapWithSandbox(
+            'curl -s --max-time 2 http://malicious-github.com 2>&1',
+          )
 
-        // Test 3: Malicious lookalike domain should NOT match
-        const command3 = await SandboxManager.wrapWithSandbox(
-          'curl -s --max-time 2 http://malicious-github.com 2>&1',
-        )
+          const result3 = await spawnAsync(command3, {
+            shell: true,
+            encoding: 'utf8',
+            timeout: 3000,
+          })
 
-        const result3 = spawnSync(command3, {
-          shell: true,
-          encoding: 'utf8',
-          timeout: 3000,
-        })
+          // Should be blocked - malicious-github.com does NOT match *.github.com
+          const output3 = result3.stdout.toLowerCase()
+          expect(output3).toContain('blocked by network allowlist')
 
-        // Should be blocked - malicious-github.com does NOT match *.github.com
-        const output3 = result3.stdout.toLowerCase()
-        expect(output3).toContain('blocked by network allowlist')
+          // Test 4: Multiple subdomains should match
+          const command4 = await SandboxManager.wrapWithSandbox(
+            'curl -s --max-time 3 http://raw.githubusercontent.com 2>&1 | head -20',
+          )
 
-        // Test 4: Multiple subdomains should match
-        const command4 = await SandboxManager.wrapWithSandbox(
-          'curl -s --max-time 3 http://raw.githubusercontent.com 2>&1 | head -20',
-        )
+          const result4 = await spawnAsync(command4, {
+            shell: true,
+            encoding: 'utf8',
+            timeout: 5000,
+          })
 
-        const result4 = spawnSync(command4, {
-          shell: true,
-          encoding: 'utf8',
-          timeout: 5000,
-        })
-
-        // githubusercontent.com should be blocked (doesn't match *.github.com)
-        const output4 = result4.stdout.toLowerCase()
-        expect(output4).toContain('blocked by network allowlist')
-
-        // Restore original config
-        await SandboxManager.reset()
-        await SandboxManager.initialize(createTestConfig(TEST_DIR))
+          // githubusercontent.com should be blocked (doesn't match *.github.com)
+          const output4 = result4.stdout.toLowerCase()
+          expect(output4).toContain('blocked by network allowlist')
+        } finally {
+          // Restore the suite's default allowlist for subsequent tests.
+          SandboxManager.updateConfig(baseConfig)
+        }
       })
 
       it('should prevent creation of special file types that could bypass restrictions', async () => {
@@ -870,7 +876,7 @@ describe.if(isLinux)('Sandbox Integration Tests', () => {
           `mkfifo ${fifoPath} && test -p ${fifoPath} && echo "FIFO created"`,
         )
 
-        const result1 = spawnSync(command1, {
+        const result1 = await spawnAsync(command1, {
           shell: true,
           encoding: 'utf8',
           timeout: 3000,
@@ -886,7 +892,7 @@ describe.if(isLinux)('Sandbox Integration Tests', () => {
           `echo "test content" > ${regularFile}`,
         )
 
-        spawnSync(command2a, {
+        await spawnAsync(command2a, {
           shell: true,
           encoding: 'utf8',
           timeout: 3000,
@@ -897,7 +903,7 @@ describe.if(isLinux)('Sandbox Integration Tests', () => {
           `ln /etc/passwd ${hardlinkPath} 2>&1`,
         )
 
-        const result2b = spawnSync(command2b, {
+        const result2b = await spawnAsync(command2b, {
           shell: true,
           encoding: 'utf8',
           timeout: 3000,
@@ -916,7 +922,7 @@ describe.if(isLinux)('Sandbox Integration Tests', () => {
           `mknod ${devicePath} c 1 3 2>&1`,
         )
 
-        const result3 = spawnSync(command3, {
+        const result3 = await spawnAsync(command3, {
           shell: true,
           encoding: 'utf8',
           timeout: 3000,
@@ -995,7 +1001,7 @@ describe.if(isLinux)(
           'curl -s --max-time 2 --connect-timeout 2 http://example.com 2>&1 || echo "network_failed"',
         )
 
-        const result = spawnSync(command, {
+        const result = await spawnAsync(command, {
           shell: true,
           encoding: 'utf8',
           timeout: 5000,
@@ -1029,7 +1035,7 @@ describe.if(isLinux)(
           'curl -s --max-time 2 --connect-timeout 2 https://example.com 2>&1 || echo "network_failed"',
         )
 
-        const result = spawnSync(command, {
+        const result = await spawnAsync(command, {
           shell: true,
           encoding: 'utf8',
           timeout: 5000,
@@ -1057,7 +1063,7 @@ describe.if(isLinux)(
           'host example.com 2>&1 || nslookup example.com 2>&1 || echo "dns_failed"',
         )
 
-        const result = spawnSync(command, {
+        const result = await spawnAsync(command, {
           shell: true,
           encoding: 'utf8',
           timeout: 5000,
@@ -1083,7 +1089,7 @@ describe.if(isLinux)(
           'wget -q --timeout=2 -O - http://example.com 2>&1 || echo "wget_failed"',
         )
 
-        const result = spawnSync(command, {
+        const result = await spawnAsync(command, {
           shell: true,
           encoding: 'utf8',
           timeout: 5000,
@@ -1111,7 +1117,7 @@ describe.if(isLinux)(
           `echo "${testContent}" > ${testFile} && cat ${testFile}`,
         )
 
-        const result = spawnSync(command, {
+        const result = await spawnAsync(command, {
           shell: true,
           encoding: 'utf8',
           cwd: TEST_DIR,
@@ -1150,7 +1156,7 @@ describe.if(isLinux)(
           'curl -s --max-time 5 http://example.com 2>&1',
         )
 
-        const result = spawnSync(command, {
+        const result = await spawnAsync(command, {
           shell: true,
           encoding: 'utf8',
           timeout: 10000,
@@ -1166,7 +1172,7 @@ describe.if(isLinux)(
           'curl -s --max-time 2 http://anthropic.com 2>&1',
         )
 
-        const result = spawnSync(command, {
+        const result = await spawnAsync(command, {
           shell: true,
           encoding: 'utf8',
           timeout: 5000,
@@ -1197,7 +1203,7 @@ describe.if(isLinux)(
           'curl -s --max-time 2 http://example.com 2>&1 || echo "blocked"',
         )
 
-        const result = spawnSync(command, {
+        const result = await spawnAsync(command, {
           shell: true,
           encoding: 'utf8',
           timeout: 5000,
@@ -1257,7 +1263,7 @@ describe.if(isLinux)('Git over SSH through sandbox proxy', () => {
       'echo "$GIT_SSH_COMMAND"',
     )
 
-    const result = spawnSync(command, {
+    const result = await spawnAsync(command, {
       shell: true,
       encoding: 'utf8',
       timeout: 5000,
@@ -1268,8 +1274,12 @@ describe.if(isLinux)('Git over SSH through sandbox proxy', () => {
     // Must be set (issue #161: was empty on Linux)
     expect(gitSshCommand).not.toBe('')
     // Must route through socat HTTP CONNECT proxy
-    expect(gitSshCommand).toContain('ssh -o ProxyCommand=')
+    expect(gitSshCommand).toContain('-o ProxyCommand=')
     expect(gitSshCommand).toContain('socat - PROXY:localhost:')
+    // Must disable SSH connection multiplexing: a mux socket configured in the
+    // user's ssh config can't be used inside the sandbox, and OpenSSH treats
+    // mux socket failures as fatal.
+    expect(gitSshCommand).toContain('-o ControlMaster=no -o ControlPath=none')
   })
 
   it('should resolve DNS and connect when running git over SSH', async () => {
@@ -1282,7 +1292,7 @@ describe.if(isLinux)('Git over SSH through sandbox proxy', () => {
         'git ls-remote ssh://git@github.com/anthropic-experimental/sandbox-runtime.git HEAD 2>&1',
     )
 
-    const result = spawnSync(command, {
+    const result = await spawnAsync(command, {
       shell: true,
       encoding: 'utf8',
       timeout: 15000,
@@ -1298,6 +1308,42 @@ describe.if(isLinux)('Git over SSH through sandbox proxy', () => {
     // With /dev/null as the only identity, github rejects auth after a
     // successful TCP connect + SSH handshake. Reaching this error proves
     // DNS resolution and the proxy tunnel both worked.
+    expect(output).toContain('permission denied (publickey)')
+  }, 20000)
+
+  it('should run git over SSH when the user ssh config enables ControlMaster', async () => {
+    // SSH connection multiplexing breaks inside the sandbox: with a ControlPath
+    // configured, ssh creates an AF_UNIX socket for the mux client before
+    // connecting, and the seccomp filter blocks socket(AF_UNIX, ...), which
+    // ssh treats as fatal — it dies before the SSH handshake even starts.
+    // The injected GIT_SSH_COMMAND must neutralize ControlMaster/ControlPath
+    // from the user's ssh config (command-line options take precedence).
+    const sshConfigPath = join(TEST_DIR, 'ssh_config_controlmaster')
+    writeFileSync(
+      sshConfigPath,
+      `Host *\n  ControlMaster auto\n  ControlPath ${TEST_DIR}/mux-%C\n`,
+    )
+
+    const command = await SandboxManager.wrapWithSandbox(
+      `GIT_SSH_COMMAND="$GIT_SSH_COMMAND -F ${sshConfigPath} -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o IdentitiesOnly=yes -i /dev/null" ` +
+        'git ls-remote ssh://git@github.com/anthropic-experimental/sandbox-runtime.git HEAD 2>&1',
+    )
+
+    const result = await spawnAsync(command, {
+      shell: true,
+      encoding: 'utf8',
+      timeout: 15000,
+    })
+
+    const output = (result.stdout + result.stderr).toLowerCase()
+
+    // Without the ControlMaster override, ssh exits before authentication:
+    // "muxclient: socket(): Operation not permitted".
+    expect(output).not.toContain('muxclient')
+    expect(output).not.toContain('control socket')
+
+    // Reaching the publickey rejection proves the SSH handshake completed
+    // through the proxy despite the ControlMaster config.
     expect(output).toContain('permission denied (publickey)')
   }, 20000)
 })

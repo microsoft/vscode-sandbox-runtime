@@ -296,13 +296,42 @@ export function getDefaultWritePaths(): string[] {
 /**
  * Generate proxy environment variables for sandboxed processes
  */
+/**
+ * Per-tool trust-store env vars set to the TLS-termination CA cert path so
+ * HTTPS clients in the sandboxed child accept proxy-minted certs.
+ */
+export const CA_TRUST_VARS = [
+  'NODE_EXTRA_CA_CERTS',
+  'SSL_CERT_FILE',
+  'CURL_CA_BUNDLE',
+  'REQUESTS_CA_BUNDLE',
+  'PIP_CERT',
+  'GIT_SSL_CAINFO',
+  'AWS_CA_BUNDLE',
+  'CARGO_HTTP_CAINFO',
+  'DENO_CERT',
+] as const
+
 export function generateProxyEnvVars(
   httpProxyPort?: number,
   socksProxyPort?: number,
+  caCertPath?: string,
 ): string[] {
-  // Respect CLAUDE_TMPDIR if set, otherwise default to /tmp/claude
-  const tmpdir = process.env.CLAUDE_TMPDIR || '/tmp/claude'
+  // Respect the caller-provided temp dir if set, otherwise fall back to
+  // /tmp/claude. CLAUDE_CODE_TMPDIR is the current name; CLAUDE_TMPDIR is
+  // kept for backwards compatibility (#141).
+  const tmpdir =
+    process.env.CLAUDE_CODE_TMPDIR || process.env.CLAUDE_TMPDIR || '/tmp/claude'
   const envVars: string[] = [`SANDBOX_RUNTIME=1`, `TMPDIR=${tmpdir}`]
+
+  // When TLS termination is configured, the child only ever sees proxy-minted
+  // certs signed by the configured CA. Point the common per-tool trust-store
+  // env vars at it so HTTPS clients accept those certs.
+  if (caCertPath) {
+    for (const v of CA_TRUST_VARS) {
+      envVars.push(`${v}=${caCertPath}`)
+    }
+  }
 
   // If no proxy ports provided, return minimal env vars
   if (!httpProxyPort && !socksProxyPort) {
@@ -337,19 +366,28 @@ export function generateProxyEnvVars(
     envVars.push(`ALL_PROXY=socks5h://localhost:${socksProxyPort}`)
     envVars.push(`all_proxy=socks5h://localhost:${socksProxyPort}`)
 
-    // Configure Git to use SSH through the proxy so DNS resolution happens outside the sandbox
+    // Configure Git to use SSH through the proxy so DNS resolution happens outside the sandbox.
+    // ControlMaster/ControlPath are disabled because SSH connection multiplexing breaks inside
+    // the sandbox: the mux socket path from the user's ssh config (typically under ~/.ssh) is
+    // not an allowed Unix socket path, and OpenSSH treats a mux listener bind failure as fatal
+    // even with ControlMaster=auto — it exits right after authentication, before running the
+    // git command. Command-line options take precedence over ssh_config, so this neutralizes
+    // any user ControlMaster setup. ControlPath=none is needed in addition to ControlMaster=no:
+    // with ControlMaster=no alone, ssh still tries to connect to an existing mux socket at the
+    // configured ControlPath.
+    const sshMuxOverride = '-o ControlMaster=no -o ControlPath=none'
     const platform = getPlatform()
     if (platform === 'macos') {
       // macOS: use BSD nc SOCKS5 proxy support (-X 5 -x)
       envVars.push(
-        `GIT_SSH_COMMAND=ssh -o ProxyCommand='nc -X 5 -x localhost:${socksProxyPort} %h %p'`,
+        `GIT_SSH_COMMAND=ssh ${sshMuxOverride} -o ProxyCommand='nc -X 5 -x localhost:${socksProxyPort} %h %p'`,
       )
     } else if (platform === 'linux' && httpProxyPort) {
       // Linux: use socat HTTP CONNECT via the HTTP proxy bridge.
       // socat is already a required Linux sandbox dependency, and PROXY: is
       // portable across all socat versions (unlike SOCKS5-CONNECT which needs >= 1.8.0).
       envVars.push(
-        `GIT_SSH_COMMAND=ssh -o ProxyCommand='socat - PROXY:localhost:%h:%p,proxyport=${httpProxyPort}'`,
+        `GIT_SSH_COMMAND=ssh ${sshMuxOverride} -o ProxyCommand='socat - PROXY:localhost:%h:%p,proxyport=${httpProxyPort}'`,
       )
     }
 
@@ -378,10 +416,13 @@ export function generateProxyEnvVars(
     // AWS CLI - uses standard HTTPS_PROXY (v2 supports it well)
     // AWS CLI v2 respects HTTPS_PROXY which we already set above
 
-    // Google Cloud SDK - has specific proxy settings
-    // Use HTTPS proxy to match other HTTP-based tools
+    // Google Cloud SDK - has specific proxy settings.
+    // proxy/type names the protocol the *proxy* speaks, not the traffic it
+    // tunnels. Our HTTP CONNECT proxy carries TLS to Google APIs, so the
+    // correct value is "http" (gcloud only accepts http, http_no_tunnel,
+    // socks4, socks5; "https" is rejected at startup).
     if (httpProxyPort) {
-      envVars.push(`CLOUDSDK_PROXY_TYPE=https`)
+      envVars.push(`CLOUDSDK_PROXY_TYPE=http`)
       envVars.push(`CLOUDSDK_PROXY_ADDRESS=localhost`)
       envVars.push(`CLOUDSDK_PROXY_PORT=${httpProxyPort}`)
     }
