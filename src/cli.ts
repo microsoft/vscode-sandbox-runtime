@@ -1,4 +1,5 @@
 #!/usr/bin/env node
+import shellquote from 'shell-quote'
 import { Command } from 'commander'
 import { SandboxManager } from './index.js'
 import type { SandboxRuntimeConfig } from './sandbox/sandbox-config.js'
@@ -45,6 +46,89 @@ async function main(): Promise<void> {
     )
     .version(process.env.npm_package_version || '1.0.0')
 
+  // ── Windows install/uninstall ─────────────────────────────────
+  // Self-elevating one-shot install (one UAC prompt). Also
+  // available programmatically as installWindowsSandbox().
+  program
+    .command('windows-install')
+    .description(
+      'Windows: create the discriminator group + install WFP filters ' +
+        '(one UAC prompt). Then log out and back in.',
+    )
+    .option('--name <group>', 'discriminator group name')
+    .option('--group-sid <sid>', 'discriminator group SID (overrides --name)')
+    .option('--sublayer-guid <guid>', 'WFP sublayer GUID')
+    .option(
+      '--proxy-port-range <lo-hi>',
+      'loopback PERMIT port range (e.g. 60080-60089)',
+    )
+    .option('--force', 'replace an existing install with different config')
+    .action(async (o: Record<string, string | boolean | undefined>) => {
+      const { installWindowsSandbox } = await import(
+        './sandbox/windows-sandbox-utils.js'
+      )
+      const range =
+        typeof o.proxyPortRange === 'string'
+          ? (o.proxyPortRange.split('-').map(Number) as [number, number])
+          : undefined
+      try {
+        const r = installWindowsSandbox({
+          groupName: o.name as string | undefined,
+          groupSid: o.groupSid as string | undefined,
+          sublayerGuid: o.sublayerGuid as string | undefined,
+          proxyPortRange: range,
+          force: Boolean(o.force),
+        })
+        if (r.cancelled) {
+          console.error('Install cancelled at the UAC prompt. Nothing changed.')
+          process.exit(2)
+        }
+        console.log(
+          `Installed.\n` +
+            `  group: ${r.group.state}` +
+            (r.group.sid ? ` (${r.group.sid})` : '') +
+            `\n` +
+            `  WFP:   ${r.wfp.state}, ${r.wfp.filters} filters` +
+            (r.wfp.portRange
+              ? `, port range ${r.wfp.portRange[0]}-${r.wfp.portRange[1]}`
+              : '') +
+            `\n\n` +
+            (r.group.state === 'ready'
+              ? `Group is already in your token — no logout needed.`
+              : `→ LOG OUT and back in so the group SID enters your token.\n` +
+                `  Network stays up meanwhile (WFP filter-0 PERMITs ` +
+                `non-members).`),
+        )
+      } catch (e) {
+        console.error(`Error: ${(e as Error).message}`)
+        process.exit(1)
+      }
+    })
+
+  program
+    .command('windows-uninstall')
+    .description(
+      'Windows: remove WFP filters (one UAC prompt). Group is kept — ' +
+        'use `srt-win.exe group delete` for full teardown.',
+    )
+    .option('--sublayer-guid <guid>', 'WFP sublayer GUID')
+    .action(async (o: Record<string, string | undefined>) => {
+      const { uninstallWindowsSandbox } = await import(
+        './sandbox/windows-sandbox-utils.js'
+      )
+      try {
+        const r = uninstallWindowsSandbox({ sublayerGuid: o.sublayerGuid })
+        if (r.cancelled) {
+          console.error('Uninstall cancelled at the UAC prompt.')
+          process.exit(2)
+        }
+        console.log('WFP filters removed. Group membership kept.')
+      } catch (e) {
+        console.error(`Error: ${(e as Error).message}`)
+        process.exit(1)
+      }
+    })
+
   // Default command - run command in sandbox
   program
     .argument('[command...]', 'command to run in the sandbox')
@@ -74,9 +158,11 @@ async function main(): Promise<void> {
         },
       ) => {
         try {
-          // Enable debug logging if requested
+          // Enable debug logging if requested. logForDebugging() reads
+          // SRT_DEBUG (not DEBUG, to avoid clashing with the npm `debug`
+          // package and other tools) — keep this in sync with utils/debug.ts.
           if (options.debug) {
-            process.env.DEBUG = 'true'
+            process.env.SRT_DEBUG = 'true'
           }
 
           // Load config from file
@@ -147,8 +233,11 @@ async function main(): Promise<void> {
             command = options.c
             logForDebugging(`Command string mode (-c): ${command}`)
           } else if (commandArgs.length > 0) {
-            // Default mode: simple join
-            command = commandArgs.join(' ')
+            // Default mode: argv-style invocation. The result is later
+            // executed via `bash -c <command>`, so each arg must be
+            // shell-quoted to survive that re-parse — a plain join(' ')
+            // splits arguments containing whitespace (#157).
+            command = shellquote.quote(commandArgs)
             logForDebugging(`Original command: ${command}`)
           } else {
             console.error(
@@ -165,14 +254,29 @@ async function main(): Promise<void> {
             ),
           )
 
-          // Wrap the command with sandbox restrictions
-          const sandboxedCommand = await SandboxManager.wrapWithSandbox(command)
-
-          // Execute the sandboxed command
-          const child = spawn(sandboxedCommand, {
-            shell: true,
-            stdio: 'inherit',
-          })
+          // Wrap the command with sandbox restrictions. On Windows
+          // the wrapper returns an argv array that MUST be spawned
+          // with {shell:false} — that's the boundary keeping the
+          // command bytes off the host shell. On other platforms
+          // we keep the existing shell-string path.
+          let child
+          if (process.platform === 'win32') {
+            // env carries the proxy vars the sandboxed child must inherit.
+            const { argv, env } =
+              await SandboxManager.wrapWithSandboxArgv(command)
+            child = spawn(argv[0], argv.slice(1), {
+              shell: false,
+              stdio: 'inherit',
+              env,
+            })
+          } else {
+            const sandboxedCommand =
+              await SandboxManager.wrapWithSandbox(command)
+            child = spawn(sandboxedCommand, {
+              shell: true,
+              stdio: 'inherit',
+            })
+          }
 
           // Handle process exit
           child.on('exit', (code, signal) => {
